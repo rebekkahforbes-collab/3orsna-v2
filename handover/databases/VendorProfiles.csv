@@ -1,0 +1,3 @@
+﻿title,email,phoneNumber,vendorPosition,description,image,venues,showImage,showPhone,showEmail
+Rose Garden Events,vendor@example.com,+962797777777,Owner,Family-run wedding venues in Amman since 2005.,,,true,true,true
+Sky Venues Co.,sky@example.com,+962798888888,Events manager,Rooftop and terrace weddings.,,,true,false,true

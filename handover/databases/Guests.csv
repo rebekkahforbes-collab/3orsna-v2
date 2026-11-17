@@ -1,0 +1,4 @@
+﻿title,weddingRef,ownerId,name,phone,rsvpStatus,partySize,rsvpAt,rsvpSource,inviteToken,waStatus,waError,waLastMessageId,waLastKind,waLastSentAt,waLastInbound
+Rami Haddad,EXAMPLE-WEDDING-1,EXAMPLE-MEMBER-1,Rami Haddad,+962791111111,confirmed,3,2026-10-03T18:20:00Z,whatsapp,exampleToken1abcdefgh,read,,wamid.EXAMPLE1,invite,2026-10-02T09:00:00Z,We'll be there!
+Dana Khoury,EXAMPLE-WEDDING-1,EXAMPLE-MEMBER-1,Dana Khoury,+962792222222,declined,0,2026-10-04T12:00:00Z,page,exampleToken2abcdefgh,delivered,,wamid.EXAMPLE2,invite,2026-10-02T09:00:00Z,
+Omar Saleh,EXAMPLE-WEDDING-1,EXAMPLE-MEMBER-1,Omar Saleh,+962793333333,pending,0,,,exampleToken3abcdefgh,,,,,,

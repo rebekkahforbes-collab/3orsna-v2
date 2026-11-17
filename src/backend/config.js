@@ -4,9 +4,12 @@
    ============================================================ */
 
 /* Public invitation links look like  https://www.3orsna.com/invite/laith-sara
-   Wix routers always sit under a prefix, so a root-level
-   3orsna.com/laith-sara isn't possible. Change INVITE_PREFIX here AND
-   rename the router to match (the router's name is the prefix). */
+   The invitation is the Weddings (Item) DYNAMIC PAGE at /invite/{slug},
+   not a router (delete any old router named "invite"). If you change
+   INVITE_PREFIX here, also change:
+     · the Weddings (Item) dynamic page's URL prefix, to match
+     · the "Visit website" button URL in the WhatsApp templates
+       (https://www.3orsna.com/invite/{{1}}) in WhatsApp Manager */
 export const SITE_URL      = 'https://www.3orsna.com';
 export const INVITE_PREFIX = 'invite';
 

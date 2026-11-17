@@ -1,0 +1,3 @@
+﻿title,weddingRef,guestRef,ownerId,direction,kind,template,lang,phone,waMessageId,status,error,text,sentAt,statusAt
+invite → Rami Haddad,EXAMPLE-WEDDING-1,EXAMPLE-GUEST-1,EXAMPLE-MEMBER-1,out,invite,wedding_invitation,ar,+962791111111,wamid.EXAMPLE1,read,,,2026-10-02T09:00:00Z,2026-10-02T09:05:00Z
+reply ← Rami Haddad,EXAMPLE-WEDDING-1,EXAMPLE-GUEST-1,EXAMPLE-MEMBER-1,in,rsvp-yes,,,+962791111111,wamid.EXAMPLE3,received,,Accept,2026-10-03T18:20:00Z,2026-10-03T18:20:00Z

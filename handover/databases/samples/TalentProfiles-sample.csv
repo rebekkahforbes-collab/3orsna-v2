@@ -1,0 +1,15 @@
+﻿_id,displayName,loginEmail,phone,whatsapp,city,approved,suspended,notes
+95548075-c4e6-5da1-957b-5bedb3e33068,Noor Haddad,noor.haddad@example.com,+962790000201,+962790000201,Amman,true,false,Sample data — delete before launch
+7932d0b6-0667-549a-99c7-ee7e0611a448,Omar & Hiba Saleh,petralight@example.com,+962790000202,+962790000202,Irbid,true,false,Sample data — delete before launch
+1d39b497-8e7e-5688-b46d-0d3a7d1247cc,Yazan Khoury,yazan.khoury@example.com,+962790000203,+962790000203,Amman,true,false,Sample data — delete before launch
+51b7c1f3-675c-5c39-93c6-e22e5c8a4d3c,Sami Odeh,sami.odeh@example.com,+962790000204,+962790000204,Amman,true,false,Sample data — delete before launch
+dad09f18-3fa0-5e89-ad91-367950b07d9f,Fadi Nasser,altarab@example.com,+962790000205,+962790000205,Amman,true,false,Sample data — delete before launch
+ab5f6884-d4e2-5e37-9922-0e1da8c9c6ba,Layla Mansour,layla.mansour@example.com,+962790000206,+962790000206,Amman,true,false,Sample data — delete before launch
+26ebd551-b2e6-5e19-8fd1-05487ca48849,Khaled Al-Zoubi,alfursan@example.com,+962790000207,+962790000207,Zarqa,true,false,Sample data — delete before launch
+4f60fdf9-9644-5bb0-8793-c02766259a93,Rana Qasem,rana.qasem@example.com,+962790000208,+962790000208,Amman,true,false,Sample data — delete before launch
+acdd7bed-34be-59b1-9adc-4bae00e8a065,Lina Haddadin,bloomhouse@example.com,+962790000209,+962790000209,Amman,true,false,Sample data — delete before launch
+8e50cc87-7777-5f3a-b640-d3027171ba2d,Dana Abu Ghazaleh,dana.glow@example.com,+962790000210,+962790000210,Amman,true,false,Sample data — delete before launch
+f96bcccd-8cb5-5565-b898-9bc5be5524cf,Sahar Obeidat,sahar.obeidat@example.com,+962790000211,+962790000211,Irbid,true,false,Sample data — delete before launch
+b19173d8-122a-54c3-9ab5-9ffe3f455f33,Mais Tarawneh,mais.henna@example.com,+962790000212,+962790000212,Amman,true,false,Sample data — delete before launch
+a6c2bfee-2a55-5040-bd82-7ba2a8181644,Ruba Shami,sugaratelier@example.com,+962790000213,+962790000213,Amman,true,false,Sample data — delete before launch
+c46d7c8a-42a3-5f65-ba78-14ff3df45d1f,Tareq Hijazi,aqabalens@example.com,+962790000214,+962790000214,Aqaba,true,false,Sample data — delete before launch

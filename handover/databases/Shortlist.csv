@@ -1,0 +1,4 @@
+﻿title,ownerId,itemType,itemId,category,city,image,link,status,note,enquiredAt,addedAt,updatedAt
+Rose Garden Hall,EXAMPLE-MEMBER-1,venue,EXAMPLE-VENUE-1,Venue,Amman,,/venues/rose-garden-hall,favourite,Quoted JOD 35 per guest,2026-10-02T10:00:00Z,2026-10-06T10:00:00Z,2026-10-06T10:00:00Z
+Lens & Light Studio,EXAMPLE-MEMBER-1,talent,EXAMPLE-TALENT-1,Photographer,Amman,,/talent/lens-light-studio,booked,"Booked for 12 June, deposit paid",2026-10-05T10:00:00Z,2026-10-06T10:05:00Z,2026-10-06T11:00:00Z
+DJ Kareem,EXAMPLE-MEMBER-1,talent,EXAMPLE-TALENT-2,DJ,Irbid,,/talent/dj-kareem,notForUs,Over budget,2026-10-01T09:00:00Z,2026-10-06T10:10:00Z,2026-10-06T10:30:00Z

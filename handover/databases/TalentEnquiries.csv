@@ -1,0 +1,3 @@
+﻿talentId,talentTitle,name,email,memberId,phone,eventDate,guestCount,budget,message,status,emailSent,submittedAt
+EXAMPLE-TALENT-1,Lens & Light Studio,Rami Haddad,rami@example.com,EXAMPLE-MEMBER-1,+962791111111,2027-06-12,250,1200,Are you free for our wedding on 12 June?,new,true,2026-10-04T10:00:00Z
+EXAMPLE-TALENT-2,DJ Kareem,Sara Nasser,sara@example.com,,+962795555555,2027-07-20,180,,Henna night and wedding — two nights.,new,false,2026-10-05T09:30:00Z

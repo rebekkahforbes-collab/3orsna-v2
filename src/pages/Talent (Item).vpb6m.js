@@ -19,6 +19,11 @@
 import wixLocation from 'wix-location';
 import wixWindowFrontend from 'wix-window-frontend';
 import { sendTalentEnquiry } from 'backend/talentEnquiry';
+import { getMyRole } from 'backend/accounts.web';
+import { authentication } from 'wix-members-frontend';
+import { session } from 'wix-storage-frontend';
+import { ROUTES } from 'public/routes';
+
 
 const IFRAME = '#html1';
 const ROUTE_DIRECTORY = '/wedding-talent';   // the WEDDING TALENT directory page
@@ -28,6 +33,8 @@ let queued      = [];
 let talentId    = null;
 
 $w.onReady(function () {
+    authentication.onLogin(sendViewer);
+    authentication.onLogout(sendViewer);
 
     $w(IFRAME).onMessage(async (event) => {
         const msg = event.data;
@@ -52,8 +59,11 @@ $w.onReady(function () {
             iframeReady = true;
             queued.forEach((m) => $w(IFRAME).postMessage(m));
             queued = [];
+            await sendViewer();
             return;
         }
+        if (msg.type === 'tp:signup') { goSignUp(); return; }
+        if (msg.type === 'tp:login')  { authentication.promptLogin({ mode: 'login' }).catch(() => {}); return; }
         if (msg.type === 'tp:back') { wixLocation.to(ROUTE_DIRECTORY); return; }
         if (msg.type === 'tp:enquiry') { await handleEnquiry(msg.payload); }
     });
@@ -89,6 +99,21 @@ $w.onReady(function () {
         }
     });
 });
+
+// --------------------------------------------------------------------------
+// Who is viewing — enquiries are for couples. The iframe shows a pop-up to
+// anyone else; "Create a couple account" opens sign-up with Couple chosen and
+// brings them back to this page afterwards.
+async function sendViewer() {
+    const me = await getMyRole().catch(() => null);
+    send({ type: 'tp:viewer', viewer: me ? { loggedIn: !!me.loggedIn, role: me.role || '', admin: !!me.admin } : null });
+}
+function goSignUp() {
+    session.setItem('signupRole', 'couple');
+    session.setItem('returnTo', wixLocation.url);
+    wixLocation.to(ROUTES.signup);
+}
+const GATE_CODES = ['LOGIN_REQUIRED', 'NEEDS_TYPE', 'COUPLE_ONLY'];
 
 // --------------------------------------------------------------------------
 function send(msg) {
@@ -201,9 +226,11 @@ async function handleEnquiry(payload) {
                            detail: 'Could not reach the backend: ' + ((err && err.message) || err) }));
     if (!res.ok) console.warn('[talentProfile] enquiry refused:', res.error, res.detail || '', payload);
     const detail = SHOW_ERROR_DETAILS && res.detail ? ` (${res.detail})` : '';
+    const code = GATE_CODES.includes(res.error) ? res.error : '';
     send({
         type: 'tp:enquiryResult',
         ok: !!res.ok,
+        code,
         message: res.ok
             ? (res.emailSent ? 'Sent. They will be in touch shortly.' : 'Received. We have logged your request and will pass it on.')
             : (res.error || 'That did not send. Try again in a moment.') + detail

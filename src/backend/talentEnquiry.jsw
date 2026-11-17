@@ -13,6 +13,7 @@ import wixData from 'wix-data';
 import wixCrmBackend, { triggeredEmails } from 'wix-crm-backend';
 import wixUsersBackend from 'wix-users-backend';
 import { currentMember } from 'wix-members-backend';
+import { caller } from 'backend/access';
 // Who sent this enquiry, when they're logged in — so it appears on their
 // shortlist even if they typed a different email into the form.
 async function senderId() {
@@ -47,7 +48,20 @@ function parseDateSafe(ymd) {
  * @param {string} talentId
  * @param {{name,email,phone,eventDate,guestCount,budget,message}} form
  */
+/* Enquiries are for couples. Admins pass (testing); anyone else gets a code the
+   page turns into the "create a couple account" pop-up:
+   LOGIN_REQUIRED · NEEDS_TYPE (member without an account type) · COUPLE_ONLY */
+async function requireCouple() {
+    const c = await caller();
+    if (c.admin) return c;
+    if (!c.member) throw bad('LOGIN_REQUIRED');
+    if (!c.role) throw bad('NEEDS_TYPE');
+    if (c.role !== 'couple') throw bad('COUPLE_ONLY');
+    return c;
+}
+
 export async function submitTalentEnquiry(talentId, form) {
+    await requireCouple();
 
     if (!talentId || typeof talentId !== 'string') throw bad('Missing profile.');
     if (!form || typeof form !== 'object') throw bad('Missing details.');

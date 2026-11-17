@@ -1,0 +1,3 @@
+﻿title,weddingRef,weddingSlug,guestRef,guestName,attending,partySize,phone,message,lang,source,submittedAt,fingerprint
+Rami Haddad,EXAMPLE-WEDDING-1,laith-sara,EXAMPLE-GUEST-1,Rami Haddad,true,3,+962791111111,Can't wait!,en,whatsapp,2026-10-03T18:20:00Z,
+Lina Mansour,EXAMPLE-WEDDING-1,laith-sara,,Lina Mansour,true,2,+962794444444,مبروك!,ar,page,2026-10-04T08:15:00Z,example-fingerprint

@@ -15,6 +15,7 @@
 import wixData from 'wix-data';
 import { sendRequestEmail } from 'backend/email';
 import { currentMember } from 'wix-members-backend';
+import { caller } from 'backend/access';
 // Who sent this enquiry, when they're logged in — so it appears on their
 // shortlist even if they typed a different email into the form.
 async function senderId() {
@@ -46,7 +47,20 @@ function parseDateSafe(ymd) {
  * @param {string} venueId
  * @param {{name:string,email:string,phone:string,guests:number,dates:string[]}} form
  */
+/* Enquiries are for couples. Admins pass (testing); anyone else gets a code the
+   page turns into the "create a couple account" pop-up:
+   LOGIN_REQUIRED · NEEDS_TYPE (member without an account type) · COUPLE_ONLY */
+async function requireCouple() {
+    const c = await caller();
+    if (c.admin) return c;
+    if (!c.member) throw bad('LOGIN_REQUIRED');
+    if (!c.role) throw bad('NEEDS_TYPE');
+    if (c.role !== 'couple') throw bad('COUPLE_ONLY');
+    return c;
+}
+
 export async function submitInquiry(venueId, form) {
+    await requireCouple();
 
     // ---- validate ------------------------------------------------------
     if (!venueId || typeof venueId !== 'string') throw bad('Missing venue.');
@@ -124,3 +138,40 @@ export async function submitInquiry(venueId, form) {
 
     return { id: inserted._id, emailSent };
 }
+
+/* The page calls this. It never throws (Wix hides thrown messages), so the real
+   reason always reaches the page: { ok: true, emailSent } or { ok: false, error }. */
+export async function sendInquiry(venueId, form) {
+    try {
+        return Object.assign({ ok: true }, await submitInquiry(venueId, form));
+    } catch (err) {
+        if (err && err.name === 'ValidationError') return { ok: false, error: err.message };
+        console.error('[venueInquiry] failed:', err);
+        return { ok: false, error: 'That did not send. Try again in a moment.', detail: String((err && err.message) || err) };
+    }
+}
+
+/* The contact card on a venue page: the vendor's name always, plus photo, phone
+   and email only where the vendor has switched them on (VendorProfiles
+   showImage / showPhone / showEmail; missing = shown). Read here, server-side,
+   so a hidden phone or email never reaches the browser. */
+export async function getVenueVendor(venueId) {
+    try {
+        const venue = await wixData.get('Venues', String(venueId || ''), { suppressAuth: true });
+        if (!venue || !venue.reference) return { ok: true, vendor: null };
+        const v = await wixData.get('VendorProfiles', venue.reference, { suppressAuth: true });
+        if (!v) return { ok: true, vendor: null };
+        return { ok: true, vendor: {
+            name: v.title || '',
+            position: v.vendorPosition || '',
+            about: v.description || '',
+            image: v.showImage === false ? null : (v.image || null),
+            phone: v.showPhone === false ? null : (v.phoneNumber || null),
+            email: v.showEmail === false ? null : (v.email || null)
+        } };
+    } catch (err) {
+        console.error('[venueInquiry] getVenueVendor failed:', err);
+        return { ok: false, vendor: null };
+    }
+}
+

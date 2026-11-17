@@ -292,7 +292,11 @@ export async function getVendorDashboard() {
             email: profile.email || '',
             phone: profile.phoneNumber || '',
             about: profile.description || '',
-            image: media(profile.image, 200, 200)
+            image: media(profile.image, 200, 200),
+            // What the contact card on venue pages shows. The name always shows.
+            showImage: profile.showImage !== false,
+            showPhone: profile.showPhone !== false,
+            showEmail: profile.showEmail !== false
         },
         venues,
         claims: claimRes.items.map((v) => ({
@@ -416,13 +420,20 @@ export async function saveVendorProfile(patch) {
     const name = str(patch.name, 120);
     if (!name) throw bad('We need a name for your business.');
 
-    await wixData.update('VendorProfiles', {
+    const next = {
         ...profile,
         title: name,
         vendorPosition: str(patch.position, 80),
         phoneNumber: str(patch.phone, 40),
         description: str(patch.about, 1000)
-    }, { suppressAuth: true });
+    };
+    // Contact card on venue pages: photo, phone and email can each be hidden.
+    ['showImage', 'showPhone', 'showEmail'].forEach((k) => { if (typeof patch[k] === 'boolean') next[k] = patch[k]; });
+    // Profile photo: undefined = keep, null = remove, a Wix Media address = replace.
+    if (patch.image === null) next.image = null;
+    else if (typeof patch.image === 'string' && /^(wix:image:\/\/|https:\/\/static\.wixstatic\.com\/)/.test(patch.image)) next.image = patch.image;
+
+    await wixData.update('VendorProfiles', next, { suppressAuth: true });
 
     return { ok: true };
 }

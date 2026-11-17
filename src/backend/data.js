@@ -64,6 +64,13 @@ function coupleNames(w, lang) {
   if (lang === 'ar') return `${w.brideAr || w.bride || ''} و${w.groomAr || w.groom || ''}`.trim();
   return `${w.bride || w.brideAr || ''} & ${w.groom || w.groomAr || ''}`.trim();
 }
+/* What the couple's WhatsApp invitation says until they write their own. */
+function defaultInviteMessage(w, lang) {
+  const when = dateText(w.weddingDate, lang), where = w.venue ? (lang === 'ar' ? ` في ${w.venue}` : ` at ${w.venue}`) : '';
+  return lang === 'ar'
+    ? `يسعدنا أن تشاركونا فرحتنا بزفافنا يوم ${when}${where}.`
+    : `We would love you to celebrate our wedding with us on ${when}${where}.`;
+}
 function dateText(d, lang) {
   if (!d) return lang === 'ar' ? 'قريباً' : 'soon';
   try {
@@ -90,6 +97,7 @@ function toConfig(row) {
     couplePhotoUrl: safeImg(row.couplePhotoUrl) || (row.style === 'portrait' ? safeImg(row.coverUrl) : ''),
     galleryUrls: galleryList(row.galleryUrls),
     ownArtworkUrl: safeImg(row.ownArtworkUrl),
+    cardImageUrl: safeImg(row.cardImageUrl),                // the invitation as a JPG (Premium) — sent with WhatsApp invitations
     rsvp: {
       on: row.rsvpOn !== false, deadline: toIso(row.rsvpDeadline), count: row.rsvpAskCount !== false,
       max: row.rsvpMaxParty || 4, msg: row.rsvpAskMsg !== false, phone: row.rsvpAskPhone !== false
@@ -174,6 +182,7 @@ export async function slugFree(uid, slug) {
 export async function saveWedding(uid, data, publish) {
   if (!uid) return { ok: false, reason: 'signedOut' };
   const row = toRow(data || {});
+  if (safeImg((data || {}).cardImageUrl)) row.cardImageUrl = safeImg(data.cardImageUrl);   // only ever replaced, never blanked
   if (!SLUG_RE.test(row.slug)) return { ok: false, reason: 'badSlug' };
   if (!(await slugFree(uid, row.slug))) return { ok: false, reason: 'slugTaken' };
 
@@ -365,7 +374,9 @@ export async function listGuests(uid) {
     wedding: {
       status: w.status || 'draft', slug: w.slug, invLang: w.invLang || 'en',
       names: coupleNames(w, w.invLang === 'ar' ? 'ar' : 'en'), rsvpDeadline: toIso(w.rsvpDeadline),
-      publicUrl: w.slug ? publicUrl(w.slug) : ''
+      publicUrl: w.slug ? publicUrl(w.slug) : '',
+      cardImageUrl: safeImg(w.cardImageUrl),
+      inviteMessage: w.inviteMessage || defaultInviteMessage(w, w.invLang === 'ar' ? 'ar' : 'en')
     }
   };
 }
@@ -451,6 +462,14 @@ export async function sendWhatsApp(uid, ids, kind, note) {
   if (!['invite', 'reminder', 'update'].includes(kind)) return { ok: false, reason: 'badKind' };
   if (w.status !== 'published') return { ok: false, reason: 'notPublished' };
   if (kind === 'update' && clean(note, 500).length < 3) return { ok: false, reason: 'noNote' };
+  /* The invitation is the card image + the couple's message + a link to their page. */
+  if (kind === 'invite' && !safeImg(w.cardImageUrl)) return { ok: false, reason: 'noCard' };
+  let message = '';
+  if (kind === 'invite') {
+    message = clean(note, 600) || w.inviteMessage || '';
+    if (message.length < 3) return { ok: false, reason: 'noMessage' };
+    if (message !== w.inviteMessage) { w.inviteMessage = message; await wixData.update(COL.weddings, w, SA); }   // remembered for next time
+  }
   if (!(await isConfigured())) return { ok: false, reason: 'waNotConfigured' };
 
   const list = (Array.isArray(ids) ? ids : []).map(i => clean(i, 60)).filter(Boolean).slice(0, WA.batchMax);
@@ -469,17 +488,19 @@ export async function sendWhatsApp(uid, ids, kind, note) {
     const lang = templateLang(w, g.phone);
     const couple = coupleNames(w, lang);
     const suffix = `${encodeURIComponent(w.slug)}?g=${g.inviteToken}`;
-    const body = kind === 'invite'   ? [g.name, couple, dateText(w.weddingDate, lang)]
+    const body = kind === 'invite'   ? [g.name, message, suffix]                    // Dear {{1}}, {{2}} … /invite/{{3}}
                : kind === 'reminder' ? [g.name, couple, dateText(w.rsvpDeadline || w.weddingDate, lang)]
                :                       [g.name, couple, clean(note, 500)];
     const quick = kind === 'update' ? [] : [`RSVP|yes|${g._id}`, `RSVP|no|${g._id}`];
-    const r = await sendTemplate({ to: g.phone, name: WA.templates[kind], lang, body, quickReplies: quick, urlSuffix: suffix });
+    const r = kind === 'invite'
+      ? await sendTemplate({ to: g.phone, name: WA.templates.invite, lang, body, quickReplies: quick, headerImage: safeImg(w.cardImageUrl) })
+      : await sendTemplate({ to: g.phone, name: WA.templates[kind], lang, body, quickReplies: quick, urlSuffix: suffix });
 
     await wixData.insert(COL.wa, {
       title: `${kind} → ${g.name}`, weddingRef: w._id, guestRef: g._id, ownerId: uid, direction: 'out',
       kind, template: WA.templates[kind], lang, phone: g.phone, waMessageId: r.id || '',
       status: r.ok ? 'sent' : 'failed', error: r.ok ? '' : String(r.error).slice(0, 300),
-      text: kind === 'update' ? clean(note, 500) : '', sentAt: new Date(), statusAt: new Date()
+      text: kind === 'update' ? clean(note, 500) : kind === 'invite' ? message : '', sentAt: new Date(), statusAt: new Date()
     }, SA);
     Object.assign(g, {
       waStatus: r.ok ? 'sent' : 'failed', waError: r.ok ? '' : String(r.error).slice(0, 300),

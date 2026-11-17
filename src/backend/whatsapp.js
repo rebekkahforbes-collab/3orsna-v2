@@ -75,9 +75,12 @@ async function post(body) {
 
 /* Business-initiated messages must use an approved template.
    Buttons are addressed by index, in the order they were defined
-   in WhatsApp Manager: quick replies first, then the URL button. */
-export function sendTemplate({ to, name, lang, body = [], quickReplies = [], urlSuffix = null }) {
+   in WhatsApp Manager: quick replies first, then the URL button.
+   headerImage: a public https image for templates with an IMAGE header
+   (the invitation sends the couple's card). */
+export function sendTemplate({ to, name, lang, body = [], quickReplies = [], urlSuffix = null, headerImage = null }) {
   const components = [{ type: 'body', parameters: body.map(t => ({ type: 'text', text: cleanParam(t) })) }];
+  if (headerImage) components.unshift({ type: 'header', parameters: [{ type: 'image', image: { link: String(headerImage) } }] });
   quickReplies.forEach((payload, i) => components.push({
     type: 'button', sub_type: 'quick_reply', index: String(i),
     parameters: [{ type: 'payload', payload: String(payload).slice(0, 256) }]

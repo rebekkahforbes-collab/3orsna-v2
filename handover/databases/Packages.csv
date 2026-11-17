@@ -1,0 +1,3 @@
+﻿title,description,price,guestCountMin,guestCountMax,guestCountRange,validUntilDate,owner,venue,cateringOptions,visibility
+Gold Wedding Package,"Hall, kosha, sound and lighting, Levantine Feast.",9000,150,300,150-300,2027-12-31,,,,true
+Silver Wedding Package,"Hall and sound system, Italian Dinner.",6000,100,200,100-200,2027-12-31,,,,true

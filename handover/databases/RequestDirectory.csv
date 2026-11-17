@@ -1,0 +1,3 @@
+﻿name,email,memberId,phone,numberOfGuests,suitableDates,venueName,venueId,ownerEmail,submittedAt,emailSent,status
+Rami Haddad,rami@example.com,EXAMPLE-MEMBER-1,+962791111111,250,"[""2027-06-12"",""2027-06-19""]",Rose Garden Hall,EXAMPLE-VENUE-1,vendor@example.com,2026-10-04T10:00:00Z,true,new
+Nour Ali,nour@example.com,,+962796666666,150,"[""2027-09-04""]",Sky Terrace,EXAMPLE-VENUE-2,vendor@example.com,2026-10-05T11:00:00Z,false,booked

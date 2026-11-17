@@ -21,6 +21,7 @@ import wixLocation from 'wix-location';
 import { requireRole } from 'public/role-guard';
 import { ROUTES as URLS } from 'public/routes';
 import { session } from 'wix-storage-frontend';
+import { uploadPhoto } from 'backend/vendorCreate.web';
 import { vdLoad, vdSetVisibility, vdClaim, vdSaveProfile, vdEnquiries, vdSetEnquiryStatus }
     from 'backend/vendorDashboard';
 
@@ -97,6 +98,11 @@ $w.onReady(async function () {
         }
         if (msg.type === 'vd:saveProfile') {
             await profile(msg.patch);
+        }
+        if (msg.type === 'vd:uploadPhoto') {
+            const r = await uploadPhoto(msg.dataUrl, msg.name)
+                .catch((e) => ({ ok: false, error: String((e && e.message) || e) }));
+            send({ type: 'vd:photoUploaded', ok: !!r.ok, url: r.url || '', error: r.ok ? '' : (r.detail || r.error) });
         }
         if (msg.type === 'vd:enquiryStatus') {
             await enquiryStatus(msg.id, msg.status);

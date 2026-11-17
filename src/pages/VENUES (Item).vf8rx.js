@@ -19,7 +19,12 @@
 import wixLocation from 'wix-location';
 import wixWindowFrontend from 'wix-window-frontend';
 import wixData from 'wix-data';
-import { submitInquiry } from 'backend/venueInquiry';
+import { sendInquiry, getVenueVendor } from 'backend/venueInquiry';
+import { getMyRole } from 'backend/accounts.web';
+import { authentication } from 'wix-members-frontend';
+import { session } from 'wix-storage-frontend';
+import { ROUTES } from 'public/routes';
+
 
 const IFRAME = '#html1';
 
@@ -61,6 +66,8 @@ let queued      = [];
 let venueId     = null;
 
 $w.onReady(function () {
+    authentication.onLogin(sendViewer);
+    authentication.onLogout(sendViewer);
 
     $w(IFRAME).onMessage(async (event) => {
         const msg = event.data;
@@ -85,8 +92,11 @@ $w.onReady(function () {
             iframeReady = true;
             queued.forEach((m) => $w(IFRAME).postMessage(m));
             queued = [];
+            await sendViewer();
             return;
         }
+        if (msg.type === 'detail:signup') { goSignUp(); return; }
+        if (msg.type === 'detail:login')  { authentication.promptLogin({ mode: 'login' }).catch(() => {}); return; }
         if (msg.type === 'detail:back')    { wixLocation.to(ROUTE_VENUES); return; }
         if (msg.type === 'detail:claim')   { wixLocation.to(ROUTE_CLAIM); return; }
         if (msg.type === 'detail:inquiry') { await handleInquiry(msg.payload); }
@@ -110,6 +120,21 @@ $w.onReady(function () {
         }
     });
 });
+
+// --------------------------------------------------------------------------
+// Who is viewing — enquiries are for couples. The iframe shows a pop-up to
+// anyone else; "Create a couple account" opens sign-up with Couple chosen and
+// brings them back to this page afterwards.
+async function sendViewer() {
+    const me = await getMyRole().catch(() => null);
+    send({ type: 'detail:viewer', viewer: me ? { loggedIn: !!me.loggedIn, role: me.role || '', admin: !!me.admin } : null });
+}
+function goSignUp() {
+    session.setItem('signupRole', 'couple');
+    session.setItem('returnTo', wixLocation.url);
+    wixLocation.to(ROUTES.signup);
+}
+const GATE_CODES = ['LOGIN_REQUIRED', 'NEEDS_TYPE', 'COUPLE_ONLY'];
 
 // --------------------------------------------------------------------------
 function send(msg) {
@@ -199,8 +224,9 @@ async function build(venue) {
     }
 
     const [vendor, cateringRes, packagesRes, promotionsRes] = await Promise.all([
+        // Through the backend, so only what the vendor chose to show leaves the server.
         venue.reference
-            ? wixData.get('VendorProfiles', venue.reference).catch((e) => { console.warn('[detail] vendor load failed:', e); return null; })
+            ? getVenueVendor(venue._id).then((r) => (r && r.vendor) || null).catch((e) => { console.warn('[detail] vendor load failed:', e); return null; })
             : Promise.resolve(null),
         wixData.queryReferenced('Venues', venue._id, 'Catering_venue').catch(() => ({ items: [] })),
         wixData.queryReferenced('Venues', venue._id, 'Packages_venue').catch(() => ({ items: [] })),
@@ -365,13 +391,17 @@ async function build(venue) {
     });
 
     // ---- vendor ----
+    // The vendor's contact card: name always; photo, phone and email as the
+    // vendor set them on their dashboard (already filtered by the backend).
     let vendorOut = null;
-    if (yes(venue.showVendorProfile) !== false && venue.showVendorProfile !== 'No' && vendor) {
+    if (vendor && vendor.name) {
         vendorOut = {
-            name: vendor.title || null,
-            position: vendor.vendorPosition || null,
-            about: vendor.description || null,
-            image: media(vendor.image, 200, 200)
+            name: vendor.name,
+            position: vendor.position || null,
+            about: vendor.about || null,
+            image: vendor.image ? media(vendor.image, 200, 200) : null,
+            phone: vendor.phone || null,
+            email: vendor.email || null
         };
     }
 
@@ -391,7 +421,7 @@ async function build(venue) {
             highlights: buildHighlights(venue),
             priceHeadline,
             priceCaption,
-            phone: yes(venue.showPhone) ? (venue.phoneContact || (vendor && vendor.phoneNumber) || null) : null,
+            phone: yes(venue.showPhone) ? (venue.phoneContact || (vendor && vendor.phone) || null) : null,
             email: yes(venue.showEmail) ? (venue.emailContact || (vendor && vendor.email) || null) : null,
             website: website(venue.websiteUrl),
             videoUrl: venue.videoUrl || null,
@@ -416,25 +446,19 @@ function buildHighlights(venue) {
 
 // --------------------------------------------------------------------------
 async function handleInquiry(payload) {
-    try {
-        const res = await submitInquiry(venueId, payload);
-        send({
-            type: 'detail:inquiryResult',
-            ok: true,
-            message: res.emailSent
-                ? 'Sent. The venue will be in touch shortly.'
-                : 'Received. We have logged your request and will pass it on.'
-        });
-    } catch (err) {
-        console.error('[detail] inquiry failed:', err);
-        send({
-            type: 'detail:inquiryResult',
-            ok: false,
-            message: err && err.name === 'ValidationError'
-                ? err.message
-                : 'That did not send. Try again in a moment.'
-        });
-    }
+    // sendInquiry returns { ok, error } instead of throwing (Wix hides thrown messages).
+    const res = await sendInquiry(venueId, payload)
+        .catch((err) => ({ ok: false, error: 'That did not send. Try again in a moment.', detail: String((err && err.message) || err) }));
+    if (!res.ok) console.warn('[detail] inquiry refused:', res.error, res.detail || '');
+    const code = GATE_CODES.includes(res.error) ? res.error : '';
+    send({
+        type: 'detail:inquiryResult',
+        ok: !!res.ok,
+        code,
+        message: res.ok
+            ? (res.emailSent ? 'Sent. The venue will be in touch shortly.' : 'Received. We have logged your request and will pass it on.')
+            : (code ? '' : (res.error || 'That did not send. Try again in a moment.'))
+    });
 }
 
 // ============================================================================
