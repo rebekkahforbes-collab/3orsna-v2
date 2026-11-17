@@ -1,0 +1,211 @@
+// ============================================================================
+//  backend/talentEnquiry.jsw
+//
+//  The recipient is never a parameter. It is resolved from the listing's owner
+//  profile server-side, which is the one thing that stops this being an open
+//  email relay — the venue version takes ownerEmail from the browser, so anyone
+//  can POST to it with any address and any body.
+// ============================================================================
+
+import wixData from 'wix-data';
+// Swap to your own sender when you have one. Wix's triggered emails are fine to
+// start with; a transactional provider gives you delivery logs.
+import wixCrmBackend, { triggeredEmails } from 'wix-crm-backend';
+import wixUsersBackend from 'wix-users-backend';
+import { currentMember } from 'wix-members-backend';
+// Who sent this enquiry, when they're logged in — so it appears on their
+// shortlist even if they typed a different email into the form.
+async function senderId() {
+    try { const m = await currentMember.getMember(); return m ? m._id : ''; } catch (e) { return ''; }
+}
+
+
+// Site owner / Wix admins can send test enquiries to hidden listings.
+function isSiteAdmin() {
+    try { const u = wixUsersBackend.currentUser; return u.loggedIn && (u.role === 'Admin' || u.role === 'Owner'); }
+    catch (e) { return false; }
+}
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const ISO_RE   = /^\d{4}-\d{2}-\d{2}$/;
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+// Midday UTC, so no timezone offset can shift the calendar day. Amman is UTC+3,
+// which is how every venue promotion ended up starting a day early.
+function parseDateSafe(ymd) {
+    const [y, m, d] = ymd.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+}
+
+/**
+ * Record a booking request against a talent listing and notify the freelancer.
+ * @param {string} talentId
+ * @param {{name,email,phone,eventDate,guestCount,budget,message}} form
+ */
+export async function submitTalentEnquiry(talentId, form) {
+
+    if (!talentId || typeof talentId !== 'string') throw bad('Missing profile.');
+    if (!form || typeof form !== 'object') throw bad('Missing details.');
+
+    const name  = String(form.name  || '').trim().slice(0, 120);
+    const email = String(form.email || '').trim().slice(0, 160);
+    const phone = String(form.phone || '').trim().slice(0, 40);
+    const message = String(form.message || '').trim().slice(0, 1000);
+
+    if (!name) throw bad('Add your name.');
+    if (!EMAIL_RE.test(email)) throw bad('That email address is not valid.');
+    if (!phone) throw bad('Add a phone number.');
+
+    const ymd = toYmd(form.eventDate);
+    if (!ymd) throw bad('Pick an event date.');
+
+    const eventDate = parseDateSafe(ymd);
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    if (eventDate < today) throw bad('That date has already passed.');
+
+    const guestCount = toNum(form.guestCount, 1, 10000);
+    const budget     = toNum(form.budget, 0, 10000000);
+
+    // ---- the listing must exist and be published ----
+    let talent;
+    try { talent = await wixData.get('Talent', talentId, { suppressAuth: true }); }
+    catch (err) { throw new Error('Could not read the Talent listing: ' + err.message); }
+    if (!talent) throw bad('That profile no longer exists.');
+    if (talent.visibility !== true && !isSiteAdmin()) throw bad('That profile is not taking requests right now.');
+
+    // ---- recipient comes from the data, never the caller ----
+    let recipient = '';
+    if (talent.owner) {
+        try {
+            const profile = await wixData.get('TalentProfiles', talent.owner, { suppressAuth: true });
+            if (profile && profile.suspended === true) {
+                throw bad('That profile is not taking requests right now.');
+            }
+            recipient = (profile && profile.loginEmail) || '';
+        } catch (err) {
+            if (err.name === 'ValidationError') throw err;
+            console.warn('[talentEnquiry] owner lookup failed:', err);
+        }
+    }
+
+    // ---- store first, notify second ----
+    // The record is the source of truth. If the email fails the request is not
+    // lost, and emailSent lets you find the ones that need chasing.
+    const memberId = await senderId();
+    const record = {
+        memberId,
+        talentId,
+        talentTitle: talent.title || '',
+        name, email, phone,
+        eventDate,
+        guestCount,
+        budget,
+        message,
+        status: 'new',
+        emailSent: false,
+        submittedAt: new Date()
+    };
+
+    let inserted = null, saveError = '', emailError = '';
+    try {
+        inserted = await wixData.insert('TalentEnquiries', record, { suppressAuth: true });
+    } catch (err) {
+        // Usually: the TalentEnquiries collection doesn't exist yet (import
+        // cms/TalentEnquiries.csv). Carry on and still email the talent.
+        saveError = err.message;
+        console.error('[talentEnquiry] could not save the enquiry:', err);
+    }
+
+    let emailSent = false;
+    if (recipient) {
+        try {
+            await notify(recipient, talent, record);
+            emailSent = true;
+            if (inserted) await wixData.update('TalentEnquiries', { ...inserted, emailSent: true }, { suppressAuth: true });
+        } catch (err) {
+            emailError = err.message;
+            console.error('[talentEnquiry] email failed (is the TALENT_ENQUIRY triggered email set up?):', err);
+        }
+    } else {
+        emailError = 'this talent has no email on their TalentProfiles row';
+        console.warn('[talentEnquiry] no owner email for listing', talentId);
+    }
+
+    if (!inserted && !emailSent) {
+        const tidy = (m) => String(m || 'unknown').replace(/\.+$/, '');
+        throw new Error(`Saving failed: ${tidy(saveError)}. Email failed: ${tidy(emailError)}.`);
+    }
+    return { id: inserted ? inserted._id : null, saved: !!inserted, emailSent };
+}
+
+/* The page calls this. It never throws, so the real reason always reaches
+   the page: { ok: true, emailSent } or { ok: false, error }. */
+export async function sendTalentEnquiry(talentId, form) {
+    try {
+        return Object.assign({ ok: true }, await submitTalentEnquiry(talentId, form));
+    } catch (err) {
+        if (err && err.name === 'ValidationError') return { ok: false, error: err.message };
+        console.error('[talentEnquiry] failed:', err);
+        return { ok: false, error: 'That did not send. Try again in a moment.', detail: String((err && err.message) || err) };
+    }
+}
+
+// Accepts 2027-06-12, 12/06/2027, or 2027-06-12T00:00:00.000Z.
+function toYmd(v) {
+    const s = String(v || '').trim();
+    let m;
+    if ((m = /^(\d{4})-(\d{2})-(\d{2})/.exec(s))) return `${m[1]}-${m[2]}-${m[3]}`;
+    if ((m = /^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$/.exec(s))) return `${m[3]}-${m[2].padStart(2, '0')}-${m[1].padStart(2, '0')}`;
+    return '';
+}
+
+// --------------------------------------------------------------------------
+function toNum(v, min, max) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    if (n < min || n > max) return null;
+    return n;
+}
+
+// --------------------------------------------------------------------------
+// Replace with your own template id once you have one set up in the Wix
+// dashboard under Triggered Emails. The variable names below must match the
+// placeholders in that template.
+const TEMPLATE_ID = 'TALENT_ENQUIRY';
+
+// Email someone by address. Members (talent, vendors) are emailed via their
+// member ID — creating a new contact for a member's email is refused by Wix
+// ("A member with these communication details already exists"). Anyone who
+// isn't a member gets a contact created as before.
+async function emailAddress(email, templateId, variables) {
+    const m = await wixData.query('Members/PrivateMembersData')
+        .eq('loginEmail', String(email).trim().toLowerCase()).limit(1).find({ suppressAuth: true });
+    if (m.items.length) {
+        await triggeredEmails.emailMember(templateId, m.items[0]._id, { variables });
+        return;
+    }
+    const contactId = await wixCrmBackend.createContact({ emails: [email] });
+    await wixCrmBackend.emailContact(templateId, contactId, { variables });
+}
+
+async function notify(recipientEmail, talent, record) {
+    await emailAddress(recipientEmail, TEMPLATE_ID, {
+        talentTitle: talent.title || '',
+        name:        record.name,
+        email:       record.email,
+        phone:       record.phone,
+        // Formatted here, not stored formatted — the column holds a real Date.
+        eventDate:   record.eventDate.toLocaleDateString('en-GB', {
+                         day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC'
+                     }),
+        guestCount:  record.guestCount == null ? 'Not given' : String(record.guestCount),
+        budget:      record.budget == null ? 'Not given' : `JOD ${record.budget}`,
+        message:     record.message || 'No message'
+    });
+}

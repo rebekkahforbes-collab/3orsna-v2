@@ -1,0 +1,495 @@
+// ============================================================================
+//  backend/adminReview.jsw
+//
+//  One review queue for both Venues and Talent. Supersedes backend/talentAdmin.jsw.
+//
+//  ADMIN ONLY  ————————————————————————————————————————————————————————
+//  Every export except whoAmI() calls requireAdmin() first. Admin = site owner,
+//  an email in ADMIN_EMAILS, or the Admin contact label (backend/config.js).
+//  If it ever refuses you, call whoAmI() from the page and read the site log.
+//  ——————————————————————————————————————————————————————————————————————
+//
+//  APPROVAL STATE
+//    approvalStatus (Text): pending | approved | rejected — OUR decision.
+//    visibility (Boolean): the VENDOR's own show/hide switch on their dashboard.
+//
+//    These used to be the same field, which is why the queue could not tell an
+//    unreviewed listing from one its owner had simply switched off: both read
+//    visibility=false with no rejection reason, so a vendor hiding an approved
+//    venue put it back in this queue. A listing is in search only when
+//    approvalStatus is approved AND visibility is true.
+//
+//  COLLECTION FIELDS THIS NEEDS
+//    Venues.approvalStatus    Text     <- add
+//    Venues.rejectionReason   Text     <- add
+//    Talent.approvalStatus    Text     <- add
+//    Talent.rejectionReason   Text     (already there)
+//    *.visibility             Boolean  (already there)
+//
+//  RUN ONCE, FIRST
+//    backfillApprovalStatus('all') — stamps a status on every existing row.
+//    Until it runs, rows with a blank approvalStatus match none of the tab
+//    queries and are invisible here. See the note on that function about which
+//    way old hidden listings are read.
+// ============================================================================
+
+import wixData from 'wix-data';
+import wixUsersBackend from 'wix-users-backend';
+import wixCrmBackend, { triggeredEmails } from 'wix-crm-backend';
+import { caller } from 'backend/access';
+
+async function requireAdmin() {
+    const c = await caller();
+    if (!c.admin) {
+        console.warn('[adminReview] refused — not an admin:', c.member ? c.member.loginEmail : '(logged out)');
+        throw bad('NOT_ADMIN');
+    }
+    return c;
+}
+
+// The review field differs per collection: Venues uses `approved`, Talent `approvalStatus`.
+const SF = (collection) => (Object.values(TYPES).find((t) => t.collection === collection) || {}).statusField || 'approvalStatus';
+
+// How to read a row that predates approvalStatus and is hidden with no
+// rejection reason. Under the old model that meant BOTH "not reviewed yet" and
+// "the owner switched it off", and nothing in the data separates them now.
+//   'approved' — trust the old library, keep the queue clean, and let vendors
+//                carry on managing their own listings. Matches LEGACY_STATUS in
+//                backend/vendorDashboard.jsw; change both together.
+//   'pending'  — sweep every hidden listing into the queue for a fresh look.
+const LEGACY_HIDDEN = 'approved';
+
+const TEMPLATES = {
+    talentApproved: 'TALENT_APPROVED',
+    talentRejected: 'TALENT_REJECTED',
+    venueApproved:  'VENUE_APPROVED',
+    venueRejected:  'VENUE_REJECTED'
+};
+
+// Per type, so one queue can drive two collections without branching everywhere.
+const TYPES = {
+    venue: {
+        collection: 'Venues',
+        title:      (r) => r.venueName || r.title || 'Unnamed venue',
+        image:      (r) => r.image,
+        ownerRef:   'reference',
+        ownerColl:  'VendorProfiles',
+        ownerName:  (p) => p.title || '(no name)',
+        ownerMail:  (p) => p.email,
+        statusField: 'approved',
+        link:       (r) => { const k = Object.keys(r).find((x) => x.startsWith('link-') && typeof r[x] === 'string' && r[x] && !/edit/i.test(r[x])); return k ? r[k] : null; },
+        featurable: false
+    },
+    talent: {
+        collection: 'Talent',
+        title:      (r) => r.title || 'Untitled',
+        image:      (r) => r.heroImage,
+        ownerRef:   'owner',
+        ownerColl:  'TalentProfiles',
+        ownerName:  (p) => p.displayName || '(no name)',
+        ownerMail:  (p) => p.loginEmail,
+        statusField: 'approvalStatus',
+        featurable: true
+    }
+};
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+/** Call once from the page to confirm the gate resolves in your context. */
+export async function whoAmI() {
+    const user = wixUsersBackend.currentUser;
+    let email = '';
+    try { if (user.loggedIn) email = await user.getEmail(); } catch (e) {}
+    const c = await caller();
+    const info = { loggedIn: user.loggedIn, role: user.role, email: email || null, accountType: c.role, isAdmin: c.admin };
+    console.log('[adminReview] whoAmI:', JSON.stringify(info));
+    return info;
+}
+
+// --------------------------------------------------------------------------
+/** pending | approved | rejected, falling back to the old two-field model. */
+function statusOf(r) {
+    const v = r.approvalStatus !== undefined && r.approvalStatus !== null && r.approvalStatus !== '' ? r.approvalStatus : r.approved;
+    const raw = v === true ? 'approved' : String(v || '').trim().toLowerCase();
+    if (raw === 'pending' || raw === 'approved' || raw === 'rejected') return raw;
+    if (r.visibility === true) return 'approved';
+    if (r.rejectionReason) return 'rejected';
+    return LEGACY_HIDDEN;
+}
+
+function media(raw, w = 240, h = 180) {
+    if (!raw) return null;
+    if (raw.startsWith('http')) return raw;
+    const m = /^wix:image:\/\/v1\/([^/]+)/.exec(raw);
+    return m ? `https://static.wixstatic.com/media/${m[1]}/v1/fill/w_${w},h_${h},al_c,q_75/file.jpg` : null;
+}
+
+function money(v) {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v === 'number') return isNaN(v) ? null : v;
+    const m = String(v).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+    return m ? Number(m[0]) : null;
+}
+
+/** What would make this listing look broken if published. */
+function gaps(type, r) {
+    if (type === 'venue') {
+        return [
+            !r.image ? 'cover photo' : null,
+            money(r.pricePerGuestJod) === null ? 'price per guest' : null,
+            r.maximumGuests === undefined || r.maximumGuests === null ? 'guest capacity' : null,
+            !r.notes ? 'description' : null
+        ].filter(Boolean);
+    }
+    return [
+        !r.heroImage ? 'cover photo' : null,
+        money(r.priceFrom) === null ? 'starting price' : null,
+        !r.bio ? 'description' : null,
+        !(Array.isArray(r.portfolio) && r.portfolio.length) ? 'portfolio images' : null
+    ].filter(Boolean);
+}
+
+function shape(type, r, owners) {
+    const T = TYPES[type];
+    const owner = owners[r[T.ownerRef]] || null;
+    const status = statusOf(r);
+    return {
+        type,
+        id: r._id,
+        title: T.title(r),
+        image: media(T.image(r)),
+        category: type === 'talent' ? (r.category || '') : (r.city || ''),
+        price: type === 'talent' ? money(r.priceFrom) : money(r.pricePerGuestJod),
+        priceUnit: type === 'talent' ? (r.priceUnit || '') : 'per guest',
+
+        // Our decision and the owner's switch, separately. `live` is the only
+        // one that answers "can couples see this", and it needs both.
+        status,
+        visibility: r.visibility === true,
+        live: status === 'approved' && r.visibility === true,
+
+        featured: T.featurable ? r.featured === true : null,
+        rejectionReason: r.rejectionReason || null,
+        submittedAt: r.submittedAt || r._createdDate || null,
+        link: T.link ? T.link(r) : (r.slug ? `/talent/${r.slug}` : null),
+        gaps: gaps(type, r),
+        owner: owner ? {
+            id: owner._id,
+            name: T.ownerName(owner),
+            email: T.ownerMail(owner) || null,
+            suspended: owner.suspended === true
+        } : null
+    };
+}
+
+async function loadOwners(type, rows) {
+    const T = TYPES[type];
+    const ids = [...new Set(rows.map((r) => r[T.ownerRef]).filter(Boolean))];
+    const out = {};
+    if (!ids.length) return out;
+    const res = await wixData.query(T.ownerColl)
+        .hasSome('_id', ids)
+        .limit(200)
+        .find({ suppressAuth: true });
+    res.items.forEach((p) => { out[p._id] = p; });
+    return out;
+}
+
+/** One place that turns a tab name into a filter, used by the list and counts. */
+function forTab(collection, tab) {
+    let q = wixData.query(collection);
+    switch (tab) {
+        case 'pending':  return q.eq(SF(collection), 'pending');
+        case 'live':     return q.eq(SF(collection), 'approved').eq('visibility', true);
+        // Approved by us, switched off by its owner. Nothing for you to do —
+        // it is here so it stops looking like an unreviewed listing.
+        case 'hidden':   return q.eq(SF(collection), 'approved').eq('visibility', false);
+        case 'rejected': return q.eq(SF(collection), 'rejected');
+        default:         return q.eq(SF(collection), 'pending');
+    }
+}
+
+// --------------------------------------------------------------------------
+/**
+ * @param {'pending'|'live'|'hidden'|'rejected'} tab
+ * @param {'all'|'venue'|'talent'} kind
+ */
+export async function listQueue(tab = 'pending', kind = 'all', limit = 60) {
+    await requireAdmin();
+
+    const wanted = kind === 'all' ? ['venue', 'talent'] : [kind];
+    const items = [];
+
+    for (const type of wanted) {
+        const T = TYPES[type];
+        const res = await forTab(T.collection, tab).limit(limit).find({ suppressAuth: true });
+        const owners = await loadOwners(type, res.items);
+        res.items.forEach((r) => items.push(shape(type, r, owners)));
+    }
+
+    // Oldest first in the pending queue — nobody should wait longest and be seen
+    // last. Newest first everywhere else.
+    items.sort((a, b) => {
+        const x = new Date(a.submittedAt || 0), y = new Date(b.submittedAt || 0);
+        return tab === 'pending' ? x - y : y - x;
+    });
+
+    return { tab, kind, items, counts: await counts() };
+}
+
+async function counts() {
+    const out = {};
+    for (const type of ['venue', 'talent']) {
+        const c = TYPES[type].collection;
+        const [pending, live, hidden, rejected, unstamped] = await Promise.all([
+            forTab(c, 'pending').count({ suppressAuth: true }),
+            forTab(c, 'live').count({ suppressAuth: true }),
+            forTab(c, 'hidden').count({ suppressAuth: true }),
+            forTab(c, 'rejected').count({ suppressAuth: true }),
+            // Rows the backfill has not stamped yet. Nonzero means listings are
+            // sitting in none of the tabs, which is worth seeing rather than
+            // silently missing.
+            wixData.query(c).isEmpty(SF(c)).count({ suppressAuth: true })
+        ]);
+        out[type] = { pending, live, hidden, rejected, unstamped };
+    }
+    out.pendingTotal = out.venue.pending + out.talent.pending;
+    out.unstampedTotal = out.venue.unstamped + out.talent.unstamped;
+    if (out.unstampedTotal) {
+        console.warn('[adminReview] %d rows have no review status — run backfillApprovalStatus()',
+            out.unstampedTotal);
+    }
+    return out;
+}
+
+// --------------------------------------------------------------------------
+export async function approve(type, id) {
+    await requireAdmin();
+    const T = TYPES[type];
+    if (!T) throw bad('Unknown type.');
+
+    const r = await wixData.get(T.collection, id, { suppressAuth: true });
+    if (!r) throw bad('That listing no longer exists.');
+
+    const missing = gaps(type, r);
+    if (missing.length) throw bad('Missing ' + missing.join(', ') + '. Reject with that as the reason instead.');
+
+    if (r[T.ownerRef]) {
+        const p = await wixData.get(T.ownerColl, r[T.ownerRef], { suppressAuth: true });
+        if (p && p.suspended === true) throw bad('That account is suspended. Lift the suspension first.');
+        if (p && p.approved !== true) {
+            await wixData.update(T.ownerColl, { ...p, approved: true }, { suppressAuth: true });
+        }
+    }
+
+    // Approving publishes it: submitting the listing was the owner's request to
+    // be in search, and making them come back to flip a second switch is a step
+    // that only loses them. They can hide it again from their dashboard.
+    await wixData.update(T.collection, {
+        ...r,
+        [T.statusField]: 'approved',
+        visibility: true,
+        approvedAt: new Date(),
+        rejectionReason: null
+    }, { suppressAuth: true });
+
+    console.log('[adminReview] approved %s/%s', type, id);
+
+    const emailed = await notify(type, r,
+        type === 'talent' ? TEMPLATES.talentApproved : TEMPLATES.venueApproved,
+        { listingTitle: T.title(r) });
+
+    return { type, id, status: 'approved', visibility: true, emailed };
+}
+
+// --------------------------------------------------------------------------
+export async function reject(type, id, reason) {
+    await requireAdmin();
+    const T = TYPES[type];
+    if (!T) throw bad('Unknown type.');
+
+    const text = String(reason || '').trim().slice(0, 500);
+    if (!text) throw bad('Give a reason — they see it word for word and need to know what to fix.');
+
+    const r = await wixData.get(T.collection, id, { suppressAuth: true });
+    if (!r) throw bad('That listing no longer exists.');
+
+    await wixData.update(T.collection, {
+        ...r,
+        [T.statusField]: 'rejected',
+        visibility: false,
+        rejectionReason: text,
+        approvedAt: null
+    }, { suppressAuth: true });
+
+    console.log('[adminReview] rejected %s/%s', type, id);
+
+    const emailed = await notify(type, r,
+        type === 'talent' ? TEMPLATES.talentRejected : TEMPLATES.venueRejected,
+        { listingTitle: T.title(r), reason: text });
+
+    return { type, id, status: 'rejected', visibility: false, emailed };
+}
+
+// --------------------------------------------------------------------------
+/**
+ * Take it off the site but leave it approved, so it lands in Hidden and its
+ * owner keeps control of it.
+ *
+ * This no longer returns the listing to Pending. Pending now means "the owner
+ * cannot edit this until we have looked at it" — using it for a temporary hold
+ * would lock them out of the listing you want them to fix. For that, use
+ * sendBackToReview below, or reject with a reason.
+ */
+export async function unpublish(type, id) {
+    await requireAdmin();
+    const T = TYPES[type];
+    if (!T) throw bad('Unknown type.');
+
+    const r = await wixData.get(T.collection, id, { suppressAuth: true });
+    if (!r) throw bad('That listing no longer exists.');
+
+    // Leaves rejectionReason alone — an unpublish is a hold, not a fault.
+    await wixData.update(T.collection, {
+        ...r,
+        [T.statusField]: statusOf(r) === 'rejected' ? 'rejected' : 'approved',
+        visibility: false
+    }, { suppressAuth: true });
+
+    console.log('[adminReview] unpublished %s/%s', type, id);
+    return { type, id, status: statusOf(r) === 'rejected' ? 'rejected' : 'approved', visibility: false };
+}
+
+// --------------------------------------------------------------------------
+/** Pull it back into the queue. The owner loses edit access while it is there. */
+export async function sendBackToReview(type, id) {
+    await requireAdmin();
+    const T = TYPES[type];
+    if (!T) throw bad('Unknown type.');
+
+    const r = await wixData.get(T.collection, id, { suppressAuth: true });
+    if (!r) throw bad('That listing no longer exists.');
+
+    await wixData.update(T.collection, {
+        ...r,
+        [T.statusField]: 'pending',
+        visibility: false,
+        rejectionReason: null
+    }, { suppressAuth: true });
+
+    console.log('[adminReview] sent back to review %s/%s', type, id);
+    return { type, id, status: 'pending', visibility: false };
+}
+
+// --------------------------------------------------------------------------
+export async function setFeatured(type, id, featured) {
+    await requireAdmin();
+    const T = TYPES[type];
+    if (!T || !T.featurable) throw bad('That type cannot be featured.');
+
+    const r = await wixData.get(T.collection, id, { suppressAuth: true });
+    if (!r) throw bad('That listing no longer exists.');
+    if (featured && !(statusOf(r) === 'approved' && r.visibility === true)) {
+        throw bad('It has to be approved and visible before it can be featured.');
+    }
+
+    await wixData.update(T.collection, { ...r, featured: featured === true }, { suppressAuth: true });
+    return { type, id, featured: featured === true };
+}
+
+// --------------------------------------------------------------------------
+/** Bulk approve. Per-id outcomes so one bad row does not sink the batch. */
+export async function approveMany(entries) {
+    await requireAdmin();
+    if (!Array.isArray(entries) || !entries.length) throw bad('Nothing selected.');
+    if (entries.length > 40) throw bad('Approve 40 at a time at most.');
+
+    const results = [];
+    for (const e of entries) {
+        try {
+            await approve(e.type, e.id);
+            results.push({ id: e.id, ok: true });
+        } catch (err) {
+            results.push({ id: e.id, ok: false, message: err.message });
+        }
+    }
+    return { results };
+}
+
+// --------------------------------------------------------------------------
+/**
+ * Run once after adding the approvalStatus field, then never again — every tab
+ * query filters on that column, so a row without one appears in no tab at all.
+ *
+ * Old rows are read as: visible -> approved; hidden with a rejection reason ->
+ * rejected; hidden with no reason -> LEGACY_HIDDEN (see the top of this file).
+ * That last case is the judgement call, because the old model gave "not
+ * reviewed" and "owner switched it off" the same shape.
+ *
+ * Safe to re-run: it only touches rows where approvalStatus is empty.
+ */
+export async function backfillApprovalStatus(type = 'all') {
+    await requireAdmin();
+    const wanted = type === 'all' ? ['venue', 'talent'] : [type];
+    const out = {};
+
+    for (const t of wanted) {
+        const T = TYPES[t];
+        if (!T) throw bad('Unknown type: ' + t);
+
+        let stamped = 0;
+        for (let pass = 0; pass < 25; pass++) {
+            const res = await wixData.query(T.collection)
+                .isEmpty(T.statusField)
+                .limit(100)
+                .find({ suppressAuth: true });
+            if (!res.items.length) break;
+
+            const rows = res.items.map((r) => ({ ...r, [T.statusField]: statusOf(r) }));
+            await wixData.bulkUpdate(T.collection, rows, { suppressAuth: true });
+            stamped += rows.length;
+
+            if (res.items.length < 100) break;
+        }
+        out[t] = stamped;
+        console.log('[adminReview] backfill %s: stamped %d rows', t, stamped);
+    }
+    return out;
+}
+
+// --------------------------------------------------------------------------
+// Email someone by address. Members (talent, vendors) are emailed via their
+// member ID — creating a new contact for a member's email is refused by Wix
+// ("A member with these communication details already exists"). Anyone who
+// isn't a member gets a contact created as before.
+async function emailAddress(email, templateId, variables) {
+    const m = await wixData.query('Members/PrivateMembersData')
+        .eq('loginEmail', String(email).trim().toLowerCase()).limit(1).find({ suppressAuth: true });
+    if (m.items.length) {
+        await triggeredEmails.emailMember(templateId, m.items[0]._id, { variables });
+        return;
+    }
+    const contactId = await wixCrmBackend.createContact({ emails: [email] });
+    await wixCrmBackend.emailContact(templateId, contactId, { variables });
+}
+
+async function notify(type, row, templateId, variables) {
+    const T = TYPES[type];
+    if (!row[T.ownerRef]) return false;
+    try {
+        const p = await wixData.get(T.ownerColl, row[T.ownerRef], { suppressAuth: true });
+        const to = p && T.ownerMail(p);
+        if (!to) return false;
+
+        await emailAddress(to, templateId, { name: T.ownerName(p), ...variables });
+        return true;
+    } catch (err) {
+        // A template that is not set up yet must never block a decision.
+        console.warn('[adminReview] notify failed:', err);
+        return false;
+    }
+}

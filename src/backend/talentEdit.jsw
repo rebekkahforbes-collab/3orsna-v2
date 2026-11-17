@@ -1,0 +1,268 @@
+// ============================================================================
+//  backend/talentEdit.jsw
+//
+//  A freelancer editing their own listing. Two rules, same as the venue edit
+//  module and for the same reasons:
+//
+//    1. Every read and write re-derives the caller's profile server-side and
+//       refuses a listing it does not own. A listing id in a URL is not proof.
+//    2. Only fields in EDITABLE are written. approvalStatus, visibility, featured, approvedAt
+//       and rejectionReason are decided by an admin, so a vendor cannot publish
+//       or feature themselves by posting a crafted payload.
+// ============================================================================
+
+import wixData from 'wix-data';
+import wixMembersBackend from 'wix-members-backend';
+
+// Set to true if you would rather every edit to a live listing go back through
+// review. The cost is that vendors stop fixing typos, and the queue fills with
+// one-word changes — which is why it is false.
+const REVIEW_EVERY_EDIT = false;
+
+// approvalStatus is our decision; visibility is the owner's switch. Kept in step
+// with backend/adminReview.jsw — change both together.
+const STATUS_FIELD = 'approvalStatus';
+
+// While a listing is pending, it is out of the owner's hands — that is what
+// Pending means in the review queue. Rejected stays editable, because fixing it
+// is the whole point. Set false to let owners edit pending listings too.
+const LOCK_WHILE_PENDING = true;
+
+/** pending | approved | rejected, tolerating rows the backfill has not stamped. */
+function statusOf(t) {
+    const raw = String(t[STATUS_FIELD] || '').trim().toLowerCase();
+    // No pre-approval: everything is live unless an admin rejected it.
+    return raw === 'rejected' ? 'rejected' : 'approved';
+}
+
+// Changing any of these on a live listing sends it back to Pending regardless.
+// They are the claims a couple decides on.
+const MATERIAL_FIELDS = ['category', 'priceFrom', 'priceUnit', 'title'];
+
+const EDITABLE = [
+    'title', 'category', 'headline', 'bio',
+    'city', 'serviceAreas', 'willTravel',
+    'priceFrom', 'priceTo', 'priceUnit', 'depositPercent',
+    'yearsExperience', 'eventsCompleted', 'languages',
+    'instagram', 'website', 'publicPhone', 'showPhone',
+    'heroImage', 'portfolio', 'videoUrl'
+];
+
+const NUMERIC = ['priceFrom', 'priceTo', 'depositPercent', 'yearsExperience', 'eventsCompleted'];
+const ARRAYS  = ['serviceAreas', 'languages'];
+const BOOLS   = ['willTravel', 'showPhone'];
+
+const CATEGORIES = [
+    'Photographer', 'Videographer', 'Musician', 'DJ', 'Band', 'Florist',
+    'Wedding Planner', 'Makeup Artist', 'Hair Stylist', 'Caterer',
+    'Cake Designer', 'Decorator', 'Calligrapher', 'Entertainer'
+];
+const PRICE_UNITS = ['per event', 'per hour', 'per day', 'per person'];
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+async function myProfile() {
+    const m = await wixMembersBackend.currentMember.getMember({ fieldsets: ['FULL'] });
+    if (!m) throw bad('NOT_LOGGED_IN');
+
+    const res = await wixData.query('TalentProfiles')
+        .eq('loginEmail', m.loginEmail)
+        .limit(1)
+        .find({ suppressAuth: true });
+
+    if (!res.items.length) throw bad('NO_PROFILE');
+    const p = res.items[0];
+    if (p.suspended === true) throw bad('ACCOUNT_SUSPENDED');
+    return p;
+}
+
+function media(raw, w = 400, h = 300) {
+    if (!raw) return null;
+    if (raw.startsWith('http')) return raw;
+    const m = /^wix:image:\/\/v1\/([^/]+)/.exec(raw);
+    return m ? `https://static.wixstatic.com/media/${m[1]}/v1/fill/w_${w},h_${h},al_c,q_75/file.jpg` : null;
+}
+
+function num(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return isNaN(n) ? null : n;
+}
+
+// --------------------------------------------------------------------------
+/** One listing, ownership checked, shaped for the form. */
+export async function loadMine(talentId) {
+    const p = await myProfile();
+
+    const t = await wixData.get('Talent', talentId, { suppressAuth: true });
+    if (!t) throw bad('NOT_FOUND');
+    if (t.owner !== p._id) throw bad('NOT_YOURS');
+
+    const fields = {};
+    EDITABLE.forEach((k) => { fields[k] = t[k] === undefined ? null : t[k]; });
+
+    // The picker needs a displayable URL alongside the stored URI.
+    const images = [];
+    if (t.heroImage) images.push({ url: t.heroImage, preview: media(t.heroImage), cover: true });
+    (Array.isArray(t.portfolio) ? t.portfolio : []).forEach((g) => {
+        if (g && g.src) images.push({ url: g.src, preview: media(g.src), cover: false });
+    });
+
+    return {
+        id: t._id,
+        fields,
+        images,
+        slug: t.slug || null,
+        visibility: t.visibility === true,
+        rejectionReason: t.rejectionReason || null,
+        status: statusOf(t),
+        // 'live' needs both: approved by us AND switched on by the owner.
+        state: statusOf(t) === 'approved'
+            ? (t.visibility === true ? 'live' : 'hidden')
+            : statusOf(t),
+        locked: LOCK_WHILE_PENDING && statusOf(t) === 'pending',
+        categories: CATEGORIES,
+        priceUnits: PRICE_UNITS
+    };
+}
+
+// --------------------------------------------------------------------------
+function coerce(key, value) {
+    if (ARRAYS.includes(key)) {
+        return Array.isArray(value)
+            ? [...new Set(value.filter((v) => typeof v === 'string' && v.trim()).map((v) => v.trim()))].slice(0, 20)
+            : [];
+    }
+    if (BOOLS.includes(key)) return value === true;
+    if (NUMERIC.includes(key)) {
+        if (value === null || value === undefined || value === '') return null;
+        const n = Number(value);
+        return Number.isFinite(n) ? n : null;
+    }
+    if (key === 'portfolio') {
+        return Array.isArray(value)
+            ? value.filter((g) => g && typeof g.src === 'string' && g.src).slice(0, 12).map((g, i) => ({
+                  type: 'image',
+                  itemId: String(i),
+                  src: g.src,
+                  title: '',
+                  description: typeof g.description === 'string' ? g.description.slice(0, 200) : ''
+              }))
+            : [];
+    }
+    if (value === null || value === undefined) return null;
+    const s = String(value).trim();
+    return s === '' ? null : s;
+}
+
+function handle(v) {
+    if (!v) return null;
+    return String(v).trim()
+        .replace(/^https?:\/\/(www\.)?instagram\.com\//i, '')
+        .replace(/^@/, '').replace(/\/+$/, '') || null;
+}
+
+function website(v) {
+    if (!v) return null;
+    let s = String(v).trim();
+    const md = /\[[^\]]*\]\(([^)]+)\)/.exec(s);
+    if (md) s = md[1].trim();
+    if (!s) return null;
+    if (!/^https?:\/\//i.test(s)) s = 'https://' + s.replace(/^\/+/, '');
+    return s;
+}
+
+// --------------------------------------------------------------------------
+/**
+ * @param {string} talentId
+ * @param {object} patch keys limited to EDITABLE
+ */
+export async function saveMine(talentId, patch) {
+    const p = await myProfile();
+
+    // Read fresh rather than merging into whatever the browser held at page load.
+    const t = await wixData.get('Talent', talentId, { suppressAuth: true });
+    if (!t) throw bad('NOT_FOUND');
+    if (t.owner !== p._id) throw bad('NOT_YOURS');
+    if (!patch || typeof patch !== 'object') throw bad('Nothing to save.');
+
+    if (LOCK_WHILE_PENDING && statusOf(t) === 'pending') {
+        throw bad('This listing is being reviewed. You can edit it again once we have looked at it, or if we send it back with changes.');
+    }
+
+    const title = coerce('title', patch.title);
+    if (!title) throw bad('Your listing needs a name.');
+
+    const category = coerce('category', patch.category);
+    if (!category || !CATEGORIES.includes(category)) throw bad('Pick a category from the list.');
+
+    if (!coerce('headline', patch.headline)) throw bad('Add the one-line description.');
+    if (!coerce('bio', patch.bio)) throw bad('Add the longer description.');
+    if (!coerce('city', patch.city)) throw bad('Add your base city.');
+
+    const priceFrom = coerce('priceFrom', patch.priceFrom);
+    if (priceFrom === null) throw bad('A starting price is required.');
+
+    const priceUnit = coerce('priceUnit', patch.priceUnit);
+    if (!priceUnit || !PRICE_UNITS.includes(priceUnit)) throw bad('Choose how you are priced.');
+
+    const priceTo = coerce('priceTo', patch.priceTo);
+    if (priceTo !== null && priceTo < priceFrom) throw bad('The upper price is below the starting price.');
+
+    const heroImage = coerce('heroImage', patch.heroImage);
+    if (!heroImage) throw bad('A cover photo is required.');
+
+    const dep = coerce('depositPercent', patch.depositPercent);
+    if (dep !== null && (dep < 0 || dep > 100)) throw bad('Deposit must be between 0 and 100.');
+
+    // Renaming must not collide with another listing of this vendor's.
+    if (title !== t.title) {
+        const dupe = await wixData.query('Talent')
+            .eq('owner', p._id)
+            .eq('title', title)
+            .ne('_id', talentId)
+            .limit(1)
+            .find({ suppressAuth: true });
+        if (dupe.totalCount > 0) throw bad('You already have another listing with that name.');
+    }
+
+    const next = { ...t };
+    EDITABLE.forEach((k) => {
+        if (Object.prototype.hasOwnProperty.call(patch, k)) next[k] = coerce(k, patch[k]);
+    });
+    next.instagram = handle(patch.instagram);
+    next.website = website(patch.website);
+    if (next.showPhone && !next.publicPhone) next.showPhone = false;
+
+    // ---- what happens to its published state ----
+    const materialChange = MATERIAL_FIELDS.some((k) => {
+        const before = t[k] === undefined ? null : t[k];
+        const after = next[k] === undefined ? null : next[k];
+        return String(before) !== String(after);
+    });
+
+    let requeued = false;
+
+    const wasApproved = statusOf(t) === 'approved';
+
+    // No review on edits: a live listing stays live, and one an admin
+    // rejected stays down until the admin restores it.
+
+    // An approved listing edited non-materially keeps both flags untouched, so
+    // an owner who had it hidden does not find it republished by a typo fix.
+
+    await wixData.update('Talent', next, { suppressAuth: true });
+
+    return {
+        id: talentId,
+        requeued,
+        state: statusOf(next) === 'approved'
+            ? (next.visibility === true ? 'live' : 'hidden')
+            : statusOf(next),
+        materialChange
+    };
+}

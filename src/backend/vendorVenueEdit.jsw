@@ -1,0 +1,363 @@
+// ============================================================================
+//  backend/vendorVenueEdit.jsw
+//
+//  The page version called wixData.update('Venues', patch, { suppressAuth: true })
+//  from the browser. suppressAuth is ignored in frontend code, so the only thing
+//  standing between a member and someone else's venue was the collection
+//  permission — and the page never checked that the venue belonged to the
+//  member at all.
+//
+//  Three rules here:
+//    1. Every read and write re-derives the caller's vendor profile server-side
+//       and refuses a venue it does not own.
+//    2. Only fields in EDITABLE are written. The old code sent back the whole
+//       record, which meant adminNotes, visibility, venueClaimed and _owner were
+//       all overwritten from a stale browser snapshot.
+//    3. A venue awaiting review is not editable. The dashboard hides the Edit
+//       link, but the URL is still reachable, so the refusal lives here.
+// ============================================================================
+
+import wixData from 'wix-data';
+import wixMembersBackend from 'wix-members-backend';
+
+// Anything not on this list cannot be changed through this form, no matter what
+// the client sends. Photos are handled separately — see MEDIA below.
+const EDITABLE = [
+    'venueName', 'city', 'address', 'notes',
+    'distanceFrom7thCircleKm',
+    'minimumGuests', 'maximumGuests',
+    'locationType', 'preparationSuite',
+    'pricePerGuestJod', 'pricePerPackageJod', 'depositToHoldVenueJod',
+    'startingPrice', 'cancellationNoticePeriod',
+    'cateringPolicy', 'alcoholPolicy', 'parking',
+    'venueTypes', 'eventTypesSupported', 'amenities', 'popularMonths',
+    'phoneContact', 'emailContact', 'venueLandline', 'websiteUrl',
+    'showPhone', 'showLandline', 'showEmail', 'showAddress',
+    'showPricing', 'showVendorProfile'
+];
+
+const NUMERIC = [
+    'distanceFrom7thCircleKm', 'minimumGuests', 'maximumGuests',
+    'pricePerGuestJod', 'pricePerPackageJod', 'depositToHoldVenueJod', 'startingPrice'
+];
+
+const ARRAYS = ['venueTypes', 'eventTypesSupported', 'amenities', 'popularMonths'];
+
+const YESNO = [
+    'showPhone', 'showLandline', 'showEmail',
+    'showAddress', 'showPricing', 'showVendorProfile'
+];
+
+const LINKS = {
+    catering:   { collection: 'Catering',   childField: 'venue' },
+    packages:   { collection: 'Packages',   childField: 'venue' },
+    promotions: { collection: 'Promotions', childField: 'venue' }
+};
+
+// Photo columns. galleryImagesCount holds an array of objects despite the name —
+// it could not be renamed in the collection.
+const HERO_FIELD    = 'image';
+const GALLERY_FIELD = 'galleryImagesCount';
+
+const STATUS_FIELD = 'approved';            // the review field on Venues
+const NOTE_FIELD   = 'rejectionReason';
+
+// Must match backend/vendorDashboard.jsw and backend/adminReview.jsw.
+const LEGACY_STATUS = 'approved';
+
+// Whether editing an already-approved venue sends it back through review.
+// false: a vendor can fix a typo without losing their listing for two days.
+// true:  nothing changes on a live listing without a second pair of eyes.
+// A rejected venue always goes back, whatever this says — that is what the
+// rejection asked for.
+const REVIEW_APPROVED_EDITS = false;
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+function statusOf(v) {
+    const raw = String(v[STATUS_FIELD] || '').trim().toLowerCase();
+    // No pre-approval: everything is live unless an admin rejected it.
+    return raw === 'rejected' ? 'rejected' : 'approved';
+}
+
+/** A browser can display a wix:image:// only via the static host. */
+function mediaUrl(raw, w = 900, h = 675) {
+    if (!raw) return null;
+    if (raw.startsWith('http')) return raw;
+    const m = /^wix:image:\/\/v1\/([^/]+)/.exec(raw);
+    return m ? `https://static.wixstatic.com/media/${m[1]}/v1/fill/w_${w},h_${h},al_c,q_80/file.jpg` : null;
+}
+
+/** The stored gallery, however it was written, as a clean array. */
+function galleryOf(venue) {
+    const raw = venue[GALLERY_FIELD];
+    if (!Array.isArray(raw)) return [];
+    return raw
+        .map((g) => {
+            if (!g) return null;
+            const src = typeof g === 'string' ? g : g.src;
+            if (!src) return null;
+            return {
+                src,
+                title: (g && g.title) || '',
+                description: (g && g.description) || ''
+            };
+        })
+        .filter(Boolean);
+}
+
+async function currentVendor() {
+    const member = await wixMembersBackend.currentMember.getMember({ fieldsets: ['FULL'] });
+    if (!member) throw bad('NOT_LOGGED_IN');
+
+    const email = member.loginEmail;
+    const res = await wixData.query('VendorProfiles')
+        .eq('email', email)
+        .limit(1)
+        .find({ suppressAuth: true });
+
+    if (!res.items.length) throw bad('NO_VENDOR_PROFILE');
+    return res.items[0];
+}
+
+/** Owns it, and is allowed to change it. */
+async function ownedVenue(venueId, { forWrite }) {
+    const vendor = await currentVendor();
+
+    const venue = await wixData.get('Venues', venueId, { suppressAuth: true });
+    if (!venue) throw bad('NOT_FOUND');
+    if (venue.reference !== vendor._id) throw bad('NOT_YOURS');
+
+    // Pending means our team is reading these exact details. Letting the owner
+    // change them underneath the reviewer is how a listing gets approved on
+    // content nobody checked.
+    if (statusOf(venue) === 'pending') throw bad('IN_REVIEW');
+
+    return { vendor, venue, status: statusOf(venue), forWrite };
+}
+
+// --------------------------------------------------------------------------
+/** Everything the edit form needs, with the ownership check done up front. */
+export async function loadVenueForEdit(venueId) {
+    const { vendor, venue, status } = await ownedVenue(venueId, { forWrite: false });
+
+    const [catAll, pkgAll, promAll, catLinked, pkgLinked, promLinked] = await Promise.all([
+        wixData.query('Catering').hasSome('owner', [vendor._id]).limit(200).find({ suppressAuth: true }),
+        wixData.query('Packages').hasSome('owner', [vendor._id]).limit(200).find({ suppressAuth: true }),
+        wixData.query('Promotions').hasSome('owner', [vendor._id]).limit(200).find({ suppressAuth: true }),
+        wixData.queryReferenced('Venues', venueId, 'Catering_venue').catch(() => ({ items: [] })),
+        wixData.queryReferenced('Venues', venueId, 'Packages_venue').catch(() => ({ items: [] })),
+        wixData.queryReferenced('Venues', venueId, 'Promotions_venue').catch(() => ({ items: [] }))
+    ]);
+
+    const opt = (r) => r.items.map((i) => ({ id: i._id, label: i.title || 'Untitled' }));
+    const ids = (r) => r.items.map((i) => i._id);
+
+    // Send only what the form edits. The client never sees adminNotes.
+    const fields = {};
+    EDITABLE.forEach((k) => { fields[k] = venue[k] === undefined ? null : venue[k]; });
+
+    return {
+        venueId,
+        fields,
+        status,
+        canEdit: status !== 'pending',
+        rejectionReason: status === 'rejected' ? (venue[NOTE_FIELD] || null) : null,
+        visibility: venue.visibility === true,
+        media: {
+            hero: venue[HERO_FIELD]
+                ? { src: venue[HERO_FIELD], url: mediaUrl(venue[HERO_FIELD]) }
+                : null,
+            gallery: galleryOf(venue).map((g) => ({ ...g, url: mediaUrl(g.src, 400, 300) }))
+        },
+        options: { catering: opt(catAll), packages: opt(pkgAll), promotions: opt(promAll) },
+        linked:  { catering: ids(catLinked), packages: ids(pkgLinked), promotions: ids(promLinked) }
+    };
+}
+
+// --------------------------------------------------------------------------
+function coerce(key, value) {
+    if (ARRAYS.includes(key)) {
+        return Array.isArray(value) ? value.filter((v) => typeof v === 'string' && v.trim()) : [];
+    }
+    if (YESNO.includes(key)) {
+        return value === true || value === 'Yes' ? 'Yes' : 'No';
+    }
+    if (NUMERIC.includes(key)) {
+        if (value === null || value === undefined || value === '') return null;
+        const n = Number(value);
+        // Never write NaN. The old code did: Number('') and Number('abc') both
+        // went straight into the column.
+        return Number.isFinite(n) ? n : null;
+    }
+    if (value === null || value === undefined) return null;
+    const s = String(value).trim();
+    return s === '' ? null : s;
+}
+
+/** Only accept a src we put there ourselves. */
+function validSrc(s) {
+    return typeof s === 'string' &&
+        (s.startsWith('wix:image://') || s.startsWith('https://static.wixstatic.com/'));
+}
+
+// --------------------------------------------------------------------------
+/**
+ * Save the editable fields, the photos, and reconcile the three linked lists.
+ *
+ * @param {string} venueId
+ * @param {object} patch  keys limited to EDITABLE
+ * @param {{catering:string[],packages:string[],promotions:string[]}} links
+ * @param {{hero: 'keep'|null|string, gallery: string[]|null}} media
+ *        hero: 'keep' leaves it alone, null clears it, a string replaces it.
+ *        gallery: the full list in order, or null to leave it alone.
+ */
+export async function saveVenue(venueId, patch, links, media) {
+    // Re-read and re-check. The old code merged into a snapshot taken at page
+    // load, so a change made anywhere else in between was silently reverted.
+    const { vendor, venue, status } = await ownedVenue(venueId, { forWrite: true });
+
+    if (!patch || typeof patch !== 'object') throw bad('Nothing to save.');
+
+    const name = coerce('venueName', patch.venueName);
+    if (!name) throw bad('A venue needs a name.');
+
+    const gMin = coerce('minimumGuests', patch.minimumGuests);
+    const gMax = coerce('maximumGuests', patch.maximumGuests);
+    if (gMin !== null && gMax !== null && gMin > gMax) {
+        throw bad('Minimum guests is higher than the maximum.');
+    }
+
+    const email = coerce('emailContact', patch.emailContact);
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email)) {
+        throw bad('That contact email is not valid.');
+    }
+
+    // Build the update from the fresh record, touching only allowed keys. A null
+    // clears the field — the old form could never clear anything, because every
+    // assignment was behind an `if (value)` guard.
+    const next = { ...venue };
+    EDITABLE.forEach((k) => {
+        if (Object.prototype.hasOwnProperty.call(patch, k)) {
+            next[k] = coerce(k, patch[k]);
+        }
+    });
+
+    // ---- photos -----------------------------------------------------------
+    const m = media || {};
+
+    if (m.hero !== 'keep') {
+        if (m.hero === null || m.hero === undefined) {
+            next[HERO_FIELD] = null;
+        } else if (validSrc(m.hero)) {
+            next[HERO_FIELD] = m.hero;
+        } else {
+            throw bad('That main photo could not be saved. Try uploading it again.');
+        }
+    }
+
+    if (Array.isArray(m.gallery)) {
+        // Existing photos keep whatever title and description they already had —
+        // the form does not edit those, so dropping them here would quietly
+        // erase captions set elsewhere.
+        const before = galleryOf(venue);
+        const byS = {};
+        before.forEach((g) => { byS[g.src] = g; });
+
+        const clean = m.gallery.filter(validSrc).slice(0, 24);
+        next[GALLERY_FIELD] = clean.map((src, index) => ({
+            type: 'image',
+            itemId: String(index),
+            src,
+            title: (byS[src] && byS[src].title) || '',
+            description: (byS[src] && byS[src].description) || ''
+        }));
+    }
+
+    // ---- review state -----------------------------------------------------
+    // A rejected listing that has just been edited is a listing asking to be
+    // looked at again. Clearing the reason matters too: leaving it would show
+    // the vendor an old complaint about something they have already fixed.
+    let resubmitted = false;
+    // No review on edits: a live venue stays live, and one an admin
+    // rejected stays down until the admin restores it.
+
+    await wixData.update('Venues', next, { suppressAuth: true });
+
+    // ---- linked lists ----
+    const report = {};
+    for (const key of Object.keys(LINKS)) {
+        const wanted = Array.isArray(links && links[key]) ? links[key] : null;
+        if (!wanted) continue;
+        report[key] = await reconcile(venueId, key, wanted, vendor._id);
+    }
+
+    return {
+        ok: true,
+        links: report,
+        resubmitted,
+        // What the photos now are, so the form can adopt the saved state instead
+        // of re-uploading the same files on the next save.
+        media: {
+            hero: next[HERO_FIELD] || null,
+            heroUrl: mediaUrl(next[HERO_FIELD]),
+            gallery: (next[GALLERY_FIELD] || []).map((g) => ({
+                src: g.src,
+                title: g.title || '',
+                description: g.description || '',
+                url: mediaUrl(g.src, 400, 300)
+            }))
+        }
+    };
+}
+
+// --------------------------------------------------------------------------
+async function reconcile(venueId, key, wantedIds, vendorId) {
+    const { collection, childField } = LINKS[key];
+
+    const linkedRes = await wixData
+        .queryReferenced('Venues', venueId, `${collection}_venue`)
+        .catch(() => ({ items: [] }));
+
+    const current = new Set(linkedRes.items.map((i) => i._id));
+    const wanted  = new Set(wantedIds);
+
+    // Only ever link items this vendor owns, whatever the client sent.
+    const ownedRes = await wixData.query(collection)
+        .hasSome('owner', [vendorId])
+        .limit(200)
+        .find({ suppressAuth: true });
+    const owned = new Set(ownedRes.items.map((i) => i._id));
+
+    const toAdd    = [...wanted].filter((id) => owned.has(id) && !current.has(id));
+    const toRemove = [...current].filter((id) => !wanted.has(id));
+
+    // Write the CHILD side only. The old code also called
+    // insertReference('Venues', 'Catering_venue', ...) — but Catering_venue is
+    // the computed reverse of Catering.venue, not a writable field, so those
+    // calls rejected and took the whole Promise.all down with them. That is why
+    // "Save failed" appeared even when the text fields had gone in.
+    for (const id of toRemove) {
+        await wixData.removeReference(collection, childField, id, venueId, { suppressAuth: true });
+    }
+    for (const id of toAdd) {
+        await wixData.insertReference(collection, childField, id, venueId, { suppressAuth: true });
+    }
+
+    return { added: toAdd.length, removed: toRemove.length };
+}
+
+// ============================================================================
+//  NOTE ON REMOVED PHOTOS
+//
+//  Taking a photo off a venue unlinks it from the record but leaves the file in
+//  the Media Manager. That is deliberate: the same file can be referenced by
+//  another listing or a page, and deleting it here would blank it there with no
+//  warning. Clear old files from the Media Manager by hand when you need the
+//  space, or add a scheduled job that deletes anything under /Listings that no
+//  Venues row references.
+// ============================================================================

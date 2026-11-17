@@ -1,0 +1,510 @@
+// ============================================================================
+//  backend/vendorDashboard.jsw
+//
+//  Supersedes backend/vendorVenues.jsw. Everything a signed-in vendor can see
+//  and change about their own venues, in one module.
+//
+//  The rule that matters, repeated on every function: the caller's vendor
+//  profile is derived server-side from their login email, and a venue is only
+//  touched if its reference matches. The original page code did none of this —
+//  it called wixData.update with suppressAuth from the browser, where suppressAuth
+//  is ignored, so the only protection was the collection permission.
+//
+//  Once this is in, set Venues write permission back to Admin.
+//
+//  APPROVAL
+//    approvalStatus (Text) on Venues: pending | approved | rejected.
+//    visibility stays what it always was — the VENDOR's show/hide switch. The
+//    two are separate on purpose: one field cannot mean both "an admin has
+//    checked this" and "the vendor wants it in search", and when it tried, any
+//    vendor could publish an unreviewed venue by flipping their own toggle.
+//    A venue is in search only when approvalStatus is approved AND visibility
+//    is true, and this module refuses to set visibility on anything else.
+// ============================================================================
+
+import wixData from 'wix-data';
+import wixUsersBackend from 'wix-users-backend';
+import { currentMember } from 'wix-members-backend';
+
+// ---------------------------------------------------------------------------
+//  Wix generates one link field per dynamic page, named after the page as it was
+//  when created, holding the whole path. These are the two on Venues:
+//
+//    view  ->  link-venues-title          (page keyed on title)
+//    edit  ->  link-copy-of-venues-venueName  (page keyed on venueName)
+//
+//  Note they are keyed on DIFFERENT fields, so their slugs can differ whenever
+//  venueName and title differ. Do not try to derive one path from the other.
+//
+//  The field KEY is fixed at page creation; the VALUE always reflects the page's
+//  current URL. So renaming the page later changes the value and not the key —
+//  which is why reading the value is right and hardcoding a prefix is not.
+//
+// Set false once the links are working. Everything it prints goes to the Wix
+// site logs (Dev Mode console in preview, Site Monitoring when published).
+const DEBUG = true;
+
+
+// Wix adds one link-* field per dynamic page, and its NAME depends on how the
+// page was created — so links are found by where they point, not by name:
+// the one whose URL contains "edit" is the edit page, any other is the public page.
+function linkFields(v) { return Object.keys(v || {}).filter((k) => k.startsWith('link-') && typeof v[k] === 'string' && v[k]); }
+function editLinkOf(v) { const k = linkFields(v).find((x) => /edit/i.test(v[x])); return k ? v[k] : null; }
+function viewLinkOf(v) { const k = linkFields(v).find((x) => !/edit/i.test(v[x])); return k ? v[k] : null; }
+
+const STATUS_FIELD = 'approved';            // the review field on Venues
+// The same column backend/adminReview.jsw writes when an admin rejects. One
+// field, one wording — the vendor reads exactly what the reviewer typed.
+const NOTE_FIELD   = 'rejectionReason';
+
+// Rows that predate the approvalStatus field have nothing stored. Treating them
+// as approved keeps every venue that already worked working; only listings
+// submitted from now on, which write 'pending' explicitly, are gated.
+//
+// This must match LEGACY_HIDDEN in backend/adminReview.jsw, which reads the same
+// old rows when it stamps them — if the two disagree, a venue is editable here
+// and queued there, or the reverse. Change both or neither. Once the backfill in
+// adminReview has run, every row has a real status and this stops being used.
+const LEGACY_STATUS = 'approved';
+
+function slugify(s) {
+    return String(s || '').toLowerCase().trim()
+        .replace(/[^a-z0-9\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+}
+
+/** "/venues/terrace-gardens-venue" -> "/venues" */
+function prefixOf(url) {
+    const m = /^(\/[^/]+)\//.exec(url || '');
+    return m ? m[1] : null;
+}
+
+/**
+ * Learn both prefixes from whichever rows actually have the link fields, rather
+ * than hardcoding them. Renaming a dynamic page then needs no code change.
+ */
+function learnPrefixes(rows) {
+    let view = null, edit = null;
+    for (const v of rows) {
+        if (!view) view = prefixOf(viewLinkOf(v));
+        if (!edit) edit = prefixOf(editLinkOf(v));
+        if (view && edit) break;
+    }
+    return { view, edit };
+}
+
+/**
+ * The stored value wins. The fallback only covers a row Wix has not generated a
+ * link for yet, and slugifies each page's own key field — never the other's.
+ */
+function links(v, prefixes) {
+    const view = viewLinkOf(v) ||
+        (prefixes.view ? `${prefixes.view}/${slugify(v.title || v.venueName)}` : null);
+    const edit = editLinkOf(v) ||
+        (prefixes.edit ? `${prefixes.edit}/${slugify(v.venueName || v.title)}` : null);
+    return { view: view || null, edit: edit || null };
+}
+
+/** pending | approved | rejected, whatever is actually in the column. */
+function statusOf(v) {
+    const raw = String(v[STATUS_FIELD] || '').trim().toLowerCase();
+    // No pre-approval: everything is live unless an admin rejected it.
+    return raw === 'rejected' ? 'rejected' : 'approved';
+}
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+async function me() {
+    const user = wixUsersBackend.currentUser;
+    if (!user.loggedIn) throw bad('NOT_LOGGED_IN');
+    const email = (await user.getEmail() || '').trim();
+    if (!email) throw bad('NOT_LOGGED_IN');
+    return email;
+}
+
+async function myProfile() {
+    const email = await me();
+    const res = await wixData.query('VendorProfiles')
+        .eq('email', email)
+        .limit(1)
+        .find({ suppressAuth: true });
+    if (res.items.length) return { profile: res.items[0], email };
+
+    // No profile yet (e.g. an account made before sign-up created one):
+    // create it here instead of sending them to a setup page.
+    let name = email;
+    try {
+        const m = await currentMember.getMember({ fieldsets: ['FULL'] });
+        const cd = (m && m.contactDetails) || {};
+        name = [cd.firstName, cd.lastName].filter(Boolean).join(' ') || email;
+    } catch (e) {}
+    const profile = await wixData.insert('VendorProfiles',
+        { title: name, email, phoneNumber: '' }, { suppressAuth: true });
+    if (DEBUG) console.log('[vendorDashboard] created VendorProfiles row for', email);
+    return { profile, email };
+}
+
+function media(raw, w = 320, h = 240) {
+    // Image fields can come back as an object depending on the field type.
+    if (raw && typeof raw === 'object') raw = raw.src || raw.url || '';
+    if (!raw || typeof raw !== 'string') return null;
+    if (raw.startsWith('http')) return raw;
+    const m = /^wix:image:\/\/v1\/([^/]+)/.exec(raw);
+    return m ? `https://static.wixstatic.com/media/${m[1]}/v1/fill/w_${w},h_${h},al_c,q_75/file.jpg` : null;
+}
+
+// Venues money columns hold strings with units — "55 JOD",
+// "Starting From 7000 JOD". Number() on those is NaN.
+function money(v) {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v === 'number') return isNaN(v) ? null : v;
+    const m = String(v).replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+    return m ? Number(m[0]) : null;
+}
+
+function num(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return isNaN(n) ? null : n;
+}
+
+function gapsOf(v) {
+    return [
+        !v.image ? 'cover photo' : null,
+        money(v.pricePerGuestJod) === null ? 'price per guest' : null,
+        num(v.maximumGuests) === null ? 'guest capacity' : null,
+        !v.notes ? 'description' : null
+    ].filter(Boolean);
+}
+
+function shape(v, prefixes) {
+    const status   = statusOf(v);
+    const approved = status === 'approved';
+    const pending  = status === 'pending';
+    const url      = links(v, prefixes);
+
+    return {
+        id: v._id,
+        name: v.venueName || v.title || 'Unnamed venue',
+        city: v.city || null,
+        image: media(v.image),
+        pricePerGuest: money(v.pricePerGuestJod),
+        minGuests: num(v.minimumGuests),
+        maxGuests: num(v.maximumGuests),
+        visibility: v.visibility === true,
+
+        // Where this venue sits with our team.
+        status,
+        // Only meaningful on a rejection — it is what the vendor has to fix.
+        reviewNote: status === 'rejected' ? (v[NOTE_FIELD] || null) : null,
+
+        // A venue in review is not the vendor's to change yet: the details our
+        // team is reading would move under them. A rejected one IS editable,
+        // because fixing it is the whole point of the rejection.
+        canEdit: !pending,
+        canPublish: approved,
+
+        // Links are withheld rather than disabled in the browser — an editor URL
+        // sent to the page is an editor URL someone can paste.
+        link:     approved ? url.view : null,
+        editLink: pending ? null : url.edit,
+
+        // Flags the dashboard surfaces so a vendor can see why a venue performs
+        // badly without opening it.
+        missing: gapsOf(v)
+    };
+}
+
+// --------------------------------------------------------------------------
+/** Everything the dashboard needs on load. */
+export async function getVendorDashboard() {
+    const { profile, email } = await myProfile();
+
+    const [ownedRes, claimRes] = await Promise.all([
+        wixData.query('Venues')
+            .eq('reference', profile._id)
+            .ascending('venueName')
+            .limit(100)
+            .find({ suppressAuth: true }),
+        // Venues the site owner pre-added against this address. Matched
+        // server-side; toBeClaimedByEmail is never sent to the browser.
+        wixData.query('Venues')
+            .eq('toBeClaimedByEmail', email)
+            .ne('venueClaimed', true)
+            .limit(50)
+            .find({ suppressAuth: true })
+    ]);
+
+    const prefixes = learnPrefixes(ownedRes.items);
+    const venues = ownedRes.items.map((v) => shape(v, prefixes));
+
+    if (DEBUG) {
+        console.log('=== vendorDashboard ===');
+        console.log('profile._id:', profile._id);
+        console.log('venues owned:', ownedRes.items.length, '| claims waiting:', claimRes.items.length);
+
+        if (ownedRes.items.length === 0) {
+            // Almost always the real problem: nothing matched, so there are no
+            // links to resolve in the first place.
+            console.warn('NO VENUES MATCHED. Check that Venues.reference on your rows holds this exact profile._id.');
+        } else {
+            const sample = ownedRes.items[0];
+
+            // The whole point of this block: print the link fields that EXIST on
+            // the row, so the right key can be read off rather than guessed.
+            const found = {};
+            Object.keys(sample).filter((k) => k.indexOf('link-') === 0)
+                .forEach((k) => { found[k] = sample[k]; });
+            console.log('link-* fields actually on "' + (sample.venueName || sample.title) + '":');
+            console.log(JSON.stringify(found, null, 2));
+
+            console.log('view link:', viewLinkOf(sample) || 'NONE — is the VENUE dynamic page connected to Venues?');
+            console.log('edit link:', editLinkOf(sample) || 'NONE — is the EDIT VENUE dynamic page connected to Venues, with "edit" in its URL?');
+            console.log('approvalStatus on sample:',
+                sample[STATUS_FIELD] === undefined ? 'FIELD NOT PRESENT (treated as ' + LEGACY_STATUS + ')' : sample[STATUS_FIELD]);
+            console.log('learned prefixes:', JSON.stringify(prefixes));
+
+            // Per venue, so a single bad row stands out from a broken field name.
+            venues.forEach((v) => {
+                console.log(
+                    (v.link && v.editLink ? 'ok   ' : 'GAP  ') +
+                    (v.name || '').slice(0, 28).padEnd(30) +
+                    ' [' + v.status + ']' +
+                    ' view=' + (v.link || 'NULL') +
+                    '  edit=' + (v.editLink || 'NULL')
+                );
+            });
+        }
+        console.log('=== end ===');
+    }
+
+    return {
+        profile: {
+            id: profile._id,
+            name: profile.title || '',
+            position: profile.vendorPosition || '',
+            email: profile.email || '',
+            phone: profile.phoneNumber || '',
+            about: profile.description || '',
+            image: media(profile.image, 200, 200)
+        },
+        venues,
+        claims: claimRes.items.map((v) => ({
+            id: v._id,
+            name: v.venueName || v.title || 'Unnamed venue',
+            city: v.city || null,
+            image: media(v.image)
+        })),
+        counts: {
+            venuesTotal: venues.length,
+            venuesLive: venues.filter((v) => v.visibility && v.status === 'approved').length,
+            claimsPending: claimRes.items.length,
+            underReview: venues.filter((v) => v.status === 'pending').length,
+            rejected: venues.filter((v) => v.status === 'rejected').length,
+            // Only counts venues the vendor can actually act on — nagging about
+            // gaps on a listing they are not allowed to edit is just noise.
+            needsAttention: venues.filter((v) => v.canEdit && v.missing.length).length
+        }
+    };
+}
+
+// --------------------------------------------------------------------------
+/** Show or hide one of the caller's own venues. */
+export async function setVisibility(venueId, visible) {
+    const { profile } = await myProfile();
+
+    const v = await wixData.get('Venues', venueId, { suppressAuth: true });
+    if (!v) throw bad('That venue no longer exists.');
+    if (v.reference !== profile._id) {
+        if (DEBUG) console.warn('[setVisibility] NOT_YOURS — venue.reference=%s profile._id=%s', v.reference, profile._id);
+        throw bad('NOT_YOURS');
+    }
+
+    const status = statusOf(v);
+    if (DEBUG) console.log('[setVisibility]', venueId, '| status:', status, '->', !!visible);
+
+    // Approval is checked here, not only in the browser. The dashboard hides the
+    // switch on an unapproved venue, but a hidden control is a UI convenience —
+    // this is the part that actually holds.
+    if (visible && status !== 'approved') {
+        throw bad('Our team has taken this venue down. Contact us if you would like it back on the site.');
+    }
+
+    // Publishing something half-finished wastes the couple's click and the
+    // vendor's reputation, so say what is missing instead.
+    if (visible) {
+        const gaps = gapsOf(v);
+        if (gaps.length) {
+            throw bad('Add a ' + gaps.join(', ') + ' before making this visible.');
+        }
+    }
+
+    await wixData.update('Venues', { ...v, visibility: !!visible }, { suppressAuth: true });
+    return { id: venueId, visible: !!visible };
+}
+
+// --------------------------------------------------------------------------
+/**
+ * Claim a venue the site owner pre-added against this vendor's email.
+ * The email match is re-checked here — the list query filtering by it is not
+ * access control, and the original code never re-checked at all.
+ */
+export async function claim(venueId) {
+    const { profile, email } = await myProfile();
+
+    const v = await wixData.get('Venues', venueId, { suppressAuth: true });
+    if (!v) throw bad('That venue no longer exists.');
+    if (v.venueClaimed === true || v.reference) throw bad('Someone has already claimed that venue.');
+
+    // Case-insensitive: email addresses are not case sensitive, and a venue
+    // typed in by hand will not match a login's casing reliably.
+    const target = (v.toBeClaimedByEmail || '').trim().toLowerCase();
+    if (!target || target !== email.trim().toLowerCase()) {
+        // Logged because the usual cause is a typo or a different address on the
+        // pre-added row, which is invisible from the front end.
+        if (DEBUG) console.warn('[claim] email mismatch — toBeClaimedByEmail=%s caller=%s',
+            target || '(empty)', email.trim().toLowerCase());
+        throw bad('NOT_YOURS');
+    }
+
+    await wixData.update('Venues', {
+        ...v,
+        reference: profile._id,
+        venueClaimed: true,
+        toBeClaimedByEmail: null,
+        // Your own team entered these details, so there is nothing to review —
+        // it arrives approved, and hidden until the vendor has read it.
+        [STATUS_FIELD]: v[STATUS_FIELD] || 'approved',
+        visibility: false
+    }, { suppressAuth: true });
+
+    try {
+        await wixData.insertReference('VendorProfiles', 'venues', profile._id, venueId, { suppressAuth: true });
+    } catch (refErr) {
+        // Put it back rather than leaving it claimed but unlinked, which would
+        // make it invisible in both lists and unrecoverable from the UI.
+        await wixData.update('Venues', {
+            ...v,
+            reference: null,
+            venueClaimed: false,
+            toBeClaimedByEmail: email
+        }, { suppressAuth: true });
+        throw refErr;
+    }
+
+    return { id: venueId };
+}
+
+// --------------------------------------------------------------------------
+/** Vendor account details. email is not editable — it is the identity key. */
+export async function saveVendorProfile(patch) {
+    const { profile } = await myProfile();
+    if (!patch || typeof patch !== 'object') throw bad('Nothing to save.');
+
+    const str = (v, max) => {
+        if (v === null || v === undefined) return null;
+        const s = String(v).trim();
+        return s === '' ? null : s.slice(0, max);
+    };
+
+    const name = str(patch.name, 120);
+    if (!name) throw bad('We need a name for your business.');
+
+    await wixData.update('VendorProfiles', {
+        ...profile,
+        title: name,
+        vendorPosition: str(patch.position, 80),
+        phoneNumber: str(patch.phone, 40),
+        description: str(patch.about, 1000)
+    }, { suppressAuth: true });
+
+    return { ok: true };
+}
+
+// ============================================================================
+//  COLLECTION CHANGES
+//
+//    Venues.approvalStatus   Text.  pending | approved | rejected.
+//                            New listings from the submit form write 'pending'.
+//    Venues.reviewNote       Text.  Optional. What the vendor has to fix — shown
+//                            on the row when approvalStatus is 'rejected'.
+//
+//  The dynamic venue pages and any search/filter datasets should now require
+//  approvalStatus = approved AND visibility = true. Filtering on visibility
+//  alone would publish a pending venue the moment a vendor's toggle was already
+//  on — which is possible on any row that predates this field.
+// ============================================================================
+
+// ============================================================================
+//  Venue enquiries (saved by backend/venueInquiry.jsw into RequestDirectory).
+//  A vendor sees and updates only enquiries for venues they own.
+// ============================================================================
+const ENQUIRY_STATUSES = ['new', 'contacted', 'booked', 'declined'];
+const ymd = (d) => { const x = d instanceof Date ? d : new Date(d); return isNaN(x) ? String(d || '') : x.toISOString().slice(0, 10); };
+
+async function myVenues(profileId) {
+    const r = await wixData.query('Venues').eq('reference', profileId).limit(500).find({ suppressAuth: true });
+    return r.items;
+}
+
+async function listVenueEnquiries() {
+    const { profile } = await myProfile();
+    const venues = await myVenues(profile._id);
+    if (!venues.length) return { venues: [], items: [] };
+    const r = await wixData.query('RequestDirectory').hasSome('venueId', venues.map((v) => v._id))
+        .descending('submittedAt').limit(300).find({ suppressAuth: true });
+    return {
+        venues: venues.map((v) => ({ id: v._id, name: v.venueName || v.title || 'Venue' })),
+        items: r.items.map((e) => ({
+            id: e._id, name: e.name || '', email: e.email || '', phone: e.phone || '',
+            guests: e.numberOfGuests == null ? null : e.numberOfGuests,
+            dates: (Array.isArray(e.suitableDates) ? e.suitableDates : []).map(ymd),
+            venueId: e.venueId, venueName: e.venueName || '',
+            status: ENQUIRY_STATUSES.includes(e.status) ? e.status : 'new',
+            submittedAt: e.submittedAt || e._createdDate || null
+        }))
+    };
+}
+
+async function setVenueEnquiryStatus(enquiryId, status) {
+    if (!ENQUIRY_STATUSES.includes(status)) throw bad('Unknown status.');
+    const { profile } = await myProfile();
+    const e = await wixData.get('RequestDirectory', String(enquiryId || ''), { suppressAuth: true });
+    if (!e) throw bad('That enquiry no longer exists.');
+    const venues = await myVenues(profile._id);
+    if (!venues.some((v) => v._id === e.venueId)) throw bad('NOT_YOURS');
+    await wixData.update('RequestDirectory', { ...e, status }, { suppressAuth: true });
+    return { id: e._id, status };
+}
+
+// ============================================================================
+//  Safe versions for the page. Wix replaces a thrown backend error with a
+//  generic "Unable to handle the request", so the page could never tell
+//  NO_PROFILE from a real fault. These return the reason instead:
+//    { ok: true, result }  or  { ok: false, error, validation, detail }
+// ============================================================================
+function safe(fn) {
+    return async (...args) => {
+        try {
+            return { ok: true, result: await fn(...args) };
+        } catch (err) {
+            const validation = !!(err && err.name === 'ValidationError');
+            if (!validation) console.error('[vendorDashboard] unexpected error:', err);
+            return { ok: false, validation, error: validation ? err.message : 'UNEXPECTED',
+                     detail: String((err && err.message) || err) };
+        }
+    };
+}
+// .jsw only exposes `export async function` declarations to the browser.
+export async function vdLoad()                         { return safe(getVendorDashboard)(); }
+export async function vdSetVisibility(venueId, visible) { return safe(setVisibility)(venueId, visible); }
+export async function vdClaim(venueId)                 { return safe(claim)(venueId); }
+export async function vdSaveProfile(patch)             { return safe(saveVendorProfile)(patch); }
+export async function vdEnquiries()                    { return safe(listVenueEnquiries)(); }
+export async function vdSetEnquiryStatus(id, status)   { return safe(setVenueEnquiryStatus)(id, status); }

@@ -1,0 +1,124 @@
+// ============================================================================
+//  backend/talentMedia.jsw
+//
+//  Accepts one already-resized image from the browser and puts it in the Media
+//  Manager, returning the wix:image:// URI to store on the row.
+//
+//  This is a public HTTP endpoint. Anyone who is logged in can call it, so it
+//  has to defend itself:
+//    · login required, checked server-side
+//    · hard byte cap, checked after decoding rather than trusting a length
+//    · magic-byte check, because a Content-Type or filename is just a string
+//    · per-session counter, so one account cannot fill your Media Manager
+//
+//  The client resizes to 1600px before sending, which is why the cap here can be
+//  low. A phone photo arrives at roughly 250-400 KB.
+// ============================================================================
+
+import { mediaManager } from 'wix-media-backend';
+import wixMembersBackend from 'wix-members-backend';
+
+const MAX_BYTES        = 3 * 1024 * 1024;   // after client resize this is generous
+const MAX_PER_SESSION  = 40;                // hero + portfolio + a few retries
+const FOLDER           = '/talent';
+
+// Resets when the site's backend instance recycles, which is fine — it is a
+// speed bump against a loop, not an audit trail.
+const seen = new Map();
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+// A filename and a MIME type are both caller-supplied strings. The first bytes
+// are not.
+const SIGNATURES = [
+    { ext: 'jpg',  mime: 'image/jpeg', test: (b) => b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF },
+    { ext: 'png',  mime: 'image/png',  test: (b) => b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47 },
+    { ext: 'webp', mime: 'image/webp', test: (b) => b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+                                                 && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50 }
+];
+
+function sniff(buf) {
+    if (buf.length < 12) return null;
+    return SIGNATURES.find((s) => s.test(buf)) || null;
+}
+
+function safeName(name, ext) {
+    const stem = String(name || 'image')
+        .replace(/\.[^.]+$/, '')
+        .replace(/[^a-zA-Z0-9-_]/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '')
+        .slice(0, 60) || 'image';
+    return `${stem}-${Date.now()}.${ext}`;
+}
+
+// --------------------------------------------------------------------------
+/**
+ * @param {string} base64  bare base64, no data: prefix
+ * @param {string} fileName
+ * @returns {Promise<{ok:true, url:string, bytes:number}|{ok:false, error:string}>} url is a wix:image:// URI
+ */
+/* Wix hides the message of an error thrown from a backend module, so the
+   exported functions return { ok, ... } and the page reads the reason from it. */
+async function run(tag, fn) {
+    try {
+        return Object.assign({ ok: true }, await fn());
+    } catch (e) {
+        const known = e && e.name === 'ValidationError';
+        if (!known) console.error(tag, e);
+        return { ok: false, error: known ? e.message : 'SERVER', detail: String((e && e.message) || e).slice(0, 160) };
+    }
+}
+
+export async function uploadTalentImage(base64, fileName) { return run('[talentMedia]', () => uploadImpl(base64, fileName)); }
+async function uploadImpl(base64, fileName) {
+
+    const member = await wixMembersBackend.currentMember.getMember();
+    if (!member) throw bad('NOT_LOGGED_IN');
+
+    if (typeof base64 !== 'string' || !base64) throw bad('No image data received.');
+
+    // Cheap pre-check before allocating a buffer for something absurd.
+    if (base64.length > MAX_BYTES * 1.4) throw bad('That image is too large.');
+
+    const key = member._id;
+    const count = (seen.get(key) || 0) + 1;
+    if (count > MAX_PER_SESSION) {
+        throw bad('Too many uploads in one go. Reload the page and try again.');
+    }
+    seen.set(key, count);
+
+    let buf;
+    try {
+        buf = Buffer.from(base64, 'base64');
+    } catch (err) {
+        throw bad('That image could not be read.');
+    }
+
+    // The real check, on the decoded length.
+    if (buf.length === 0) throw bad('That image is empty.');
+    if (buf.length > MAX_BYTES) throw bad('That image is too large.');
+
+    const sig = sniff(buf);
+    if (!sig) throw bad('That file is not a JPEG, PNG or WebP image.');
+
+    const uploaded = await mediaManager.upload(
+        FOLDER,
+        buf,
+        safeName(fileName, sig.ext),
+        {
+            mediaOptions: { mimeType: sig.mime, mediaType: 'image' },
+            metadataOptions: { isPrivate: false, isVisitorUpload: false }
+        }
+    );
+
+    // upload() returns a fileUrl in the wix:image:// form, which is what the
+    // Talent row expects and what the page code converts for display.
+    if (!uploaded || !uploaded.fileUrl) throw bad('The upload did not complete.');
+
+    return { url: uploaded.fileUrl, bytes: buf.length };
+}

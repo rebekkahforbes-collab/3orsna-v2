@@ -1,0 +1,315 @@
+// ============================================================================
+//  backend/talentDashboard.jsw
+//
+//  Everything a signed-in talent can see and change about their own account.
+//
+//  Two things this file is careful about:
+//
+//  · Enquiries are scoped by listing ownership, never by an id the caller sends.
+//    TalentEnquiries is Admin-read precisely because it holds couples' phone
+//    numbers; the only reason a talent may read a row is that it points at one
+//    of their listings, and that is checked here every time.
+//
+//  · loginEmail is NOT editable. It is the key that ties a Wix member to this
+//    profile, so letting it be changed would either orphan the member from their
+//    own listings or let them claim somebody else's.
+// ============================================================================
+
+import wixData from 'wix-data';
+import wixMembersBackend from 'wix-members-backend';
+
+const PAGE_SIZE = 20;
+const STATUSES = ['new', 'read', 'replied', 'closed'];
+
+// Kept in step with backend/adminReview.jsw and backend/talentEdit.jsw.
+const STATUS_FIELD = 'approvalStatus';
+
+function statusOf(t) {
+    const raw = String(t[STATUS_FIELD] || '').trim().toLowerCase();
+    // No pre-approval: everything is live unless an admin rejected it.
+    return raw === 'rejected' ? 'rejected' : 'approved';
+}
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+/* The caller's TalentProfiles row. With create = true (the dashboard load) a
+   talent who hasn't made a listing yet gets an empty profile on the spot, so
+   their dashboard opens straight away — with "Create your first listing" —
+   instead of failing until the onboarding form is finished. The name and
+   phone are filled in later, on the listing form or the Account tab. */
+async function myProfile(create = false) {
+    const m = await wixMembersBackend.currentMember.getMember({ fieldsets: ['FULL'] });
+    if (!m) throw bad('NOT_LOGGED_IN');
+
+    const res = await wixData.query('TalentProfiles')
+        .eq('loginEmail', m.loginEmail)
+        .limit(1)
+        .find({ suppressAuth: true });
+
+    let p = res.items[0];
+    if (!p) {
+        if (!create) throw bad('NO_PROFILE');
+        const c = m.contactDetails || {};
+        const name = [c.firstName, c.lastName].filter(Boolean).join(' ').trim()
+            || (m.profile && m.profile.nickname) || String(m.loginEmail || '').split('@')[0];
+        p = await wixData.insert('TalentProfiles', {
+            loginEmail: m.loginEmail,          // same key the listing form uses
+            displayName: String(name || '').slice(0, 90),
+            phone: null, whatsapp: null, city: null,
+            approved: false, suspended: false, notes: null
+        }, { suppressAuth: true });
+        console.log('[talentDashboard] created an empty profile for', m.loginEmail);
+    }
+    if (p.suspended === true) throw bad('ACCOUNT_SUSPENDED');
+    return p;
+}
+
+/* Wix hides the message of an error thrown from a backend module, so every
+   function below returns { ok, ... } and the page reads the reason from it. */
+async function run(fn) {
+    try {
+        return Object.assign({ ok: true }, await fn());
+    } catch (e) {
+        const known = e && e.name === 'ValidationError';
+        if (!known) console.error('[talentDashboard]', e);
+        return { ok: false, error: known ? e.message : 'SERVER', detail: String((e && e.message) || e).slice(0, 160) };
+    }
+}
+
+// Wix generates a link field per dynamic page, named after the page as it was
+// created, holding the whole path. Confirm the exact key in the CMS — the load
+// log below prints every link-* field on your first listing.
+const EDIT_LINK_FIELD = 'link-talent-edit-slug';
+const EDIT_PREFIX     = '/talent-edit';
+
+function prefixOf(url) {
+    const m = /^(\/[^/]+)\//.exec(url || '');
+    return m ? m[1] : null;
+}
+
+function editLinkFor(t, learnedPrefix) {
+    if (t[EDIT_LINK_FIELD]) return t[EDIT_LINK_FIELD];
+    const prefix = learnedPrefix || EDIT_PREFIX;
+    return t.slug ? `${prefix}/${t.slug}` : null;
+}
+
+function media(raw, w = 240, h = 180) {
+    if (!raw) return null;
+    if (raw.startsWith('http')) return raw;
+    const m = /^wix:image:\/\/v1\/([^/]+)/.exec(raw);
+    return m ? `https://static.wixstatic.com/media/${m[1]}/v1/fill/w_${w},h_${h},al_c,q_75/file.jpg` : null;
+}
+
+function num(v) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    return isNaN(n) ? null : n;
+}
+
+async function myListingIds(profileId) {
+    const res = await wixData.query('Talent')
+        .eq('owner', profileId)
+        .limit(100)
+        .find({ suppressAuth: true });
+    return res.items;
+}
+
+// --------------------------------------------------------------------------
+/** Everything the dashboard needs on load. */
+export async function getDashboard() { return run(dashboardImpl); }
+async function dashboardImpl() {
+    const p = await myProfile(true);
+    const listings = await myListingIds(p._id);
+    const ids = listings.map((t) => t._id);
+
+    console.log('[talentDashboard] profile=%s listings=%d', p._id, listings.length);
+
+    // Learn the edit page prefix from whichever row Wix has generated a link
+    // for, so renaming the page needs no code change.
+    let learnedEditPrefix = null;
+    for (const t of listings) {
+        learnedEditPrefix = prefixOf(t[EDIT_LINK_FIELD]);
+        if (learnedEditPrefix) break;
+    }
+    if (listings.length && !learnedEditPrefix) {
+        const sample = listings[0];
+        const found = {};
+        Object.keys(sample).filter((k) => k.indexOf('link-') === 0)
+            .forEach((k) => { found[k] = sample[k]; });
+        console.warn('[talentDashboard] %s not found. link-* fields actually present:', EDIT_LINK_FIELD);
+        console.warn(JSON.stringify(found, null, 2));
+    }
+
+    // Enquiries are secondary. If TalentEnquiries has not been created yet, or a
+    // field it queries is missing, that must not take the whole dashboard down —
+    // the listings are the point of the page.
+    let enquiryCounts = { total: 0, unread: 0, upcoming: 0 };
+    let enquiriesAvailable = true;
+
+    if (ids.length) {
+        try {
+            const today = new Date(); today.setHours(0, 0, 0, 0);
+            const [all, unread, upcoming] = await Promise.all([
+                wixData.query('TalentEnquiries').hasSome('talentId', ids).count({ suppressAuth: true }),
+                wixData.query('TalentEnquiries').hasSome('talentId', ids).eq('status', 'new').count({ suppressAuth: true }),
+                wixData.query('TalentEnquiries').hasSome('talentId', ids).ge('eventDate', today).count({ suppressAuth: true })
+            ]);
+            enquiryCounts = { total: all, unread, upcoming };
+        } catch (err) {
+            enquiriesAvailable = false;
+            console.warn('[talentDashboard] enquiry counts failed — check the TalentEnquiries collection exists with talentId, status and eventDate fields:', err && err.message);
+        }
+    }
+
+    return {
+        profile: {
+            id: p._id,
+            displayName: p.displayName || '',
+            // Shown but not editable — see the header note.
+            loginEmail: p.loginEmail || '',
+            phone: p.phone || '',
+            whatsapp: p.whatsapp || '',
+            city: p.city || '',
+            approved: p.approved === true,
+            // Profiles made automatically on first visit have no phone yet.
+            complete: !!(p.displayName && p.phone)
+        },
+        listings: listings.map((t) => ({
+            id: t._id,
+            editLink: editLinkFor(t, learnedEditPrefix),
+            title: t.title || 'Untitled',
+            category: t.category || '',
+            slug: t.slug || null,
+            image: media(t.heroImage),
+            priceFrom: num(t.priceFrom),
+            priceUnit: t.priceUnit || null,
+            portfolioCount: Array.isArray(t.portfolio) ? t.portfolio.length : 0,
+            visibility: t.visibility === true,
+            featured: t.featured === true,
+            rejectionReason: t.rejectionReason || null,
+            status: statusOf(t),
+            // Four states now, not three: approved-but-switched-off is the
+            // owner's own doing and must not read as "in review".
+            state: statusOf(t) === 'approved'
+                ? (t.visibility === true ? 'live' : 'hidden')
+                : statusOf(t)
+        })),
+        // Distinctly named. An earlier version spread enquiryCounts over a
+        // `total` key that already meant "number of listings", so the listing
+        // count silently became the enquiry count.
+        enquiriesAvailable,
+        counts: {
+            listingsLive:      listings.filter((t) => statusOf(t) === 'approved' && t.visibility === true).length,
+            listingsTotal:     listings.length,
+            enquiriesTotal:    enquiryCounts.total,
+            enquiriesUnread:   enquiryCounts.unread,
+            enquiriesUpcoming: enquiryCounts.upcoming
+        }
+    };
+}
+
+// --------------------------------------------------------------------------
+/** Booking requests against this talent's listings. */
+export async function listEnquiries(filter = 'all', skip = 0) { return run(() => enquiriesImpl(filter, skip)); }
+async function enquiriesImpl(filter, skip) {
+    const p = await myProfile();
+    const listings = await myListingIds(p._id);
+    const ids = listings.map((t) => t._id);
+    const titleById = {};
+    listings.forEach((t) => { titleById[t._id] = t.title || 'Untitled'; });
+
+    if (!ids.length) return { items: [], total: 0, skip: 0, hasMore: false };
+
+    let q = wixData.query('TalentEnquiries').hasSome('talentId', ids);
+
+    if (filter === 'new') q = q.eq('status', 'new');
+    else if (filter === 'upcoming') {
+        const today = new Date(); today.setHours(0, 0, 0, 0);
+        q = q.ge('eventDate', today).ne('status', 'closed');
+    } else if (filter === 'closed') q = q.eq('status', 'closed');
+
+    let res;
+    try {
+        res = await q
+            .descending('submittedAt')
+            .skip(skip)
+            .limit(PAGE_SIZE)
+            .find({ suppressAuth: true });
+    } catch (err) {
+        console.warn('[talentDashboard] listEnquiries failed:', err && err.message);
+        return { items: [], total: 0, skip: 0, hasMore: false, unavailable: true };
+    }
+
+    return {
+        items: res.items.map((e) => ({
+            id: e._id,
+            listing: titleById[e.talentId] || e.talentTitle || '',
+            name: e.name || '',
+            email: e.email || '',
+            phone: e.phone || '',
+            eventDate: e.eventDate || null,
+            guestCount: num(e.guestCount),
+            budget: num(e.budget),
+            message: e.message || '',
+            status: STATUSES.includes(e.status) ? e.status : 'new',
+            // Lets the talent know a request arrived that they were never
+            // emailed about — otherwise a failed notification is invisible.
+            emailSent: e.emailSent === true,
+            submittedAt: e.submittedAt || null
+        })),
+        total: res.totalCount,
+        skip,
+        hasMore: skip + res.items.length < res.totalCount
+    };
+}
+
+// --------------------------------------------------------------------------
+export async function setEnquiryStatus(enquiryId, status) { return run(() => statusImpl(enquiryId, status)); }
+async function statusImpl(enquiryId, status) {
+    const p = await myProfile();
+    if (!STATUSES.includes(status)) throw bad('Unknown status.');
+
+    const e = await wixData.get('TalentEnquiries', enquiryId, { suppressAuth: true });
+    if (!e) throw bad('That request no longer exists.');
+
+    // The ownership check. An enquiry id on its own proves nothing.
+    const listings = await myListingIds(p._id);
+    if (!listings.some((t) => t._id === e.talentId)) throw bad('NOT_YOURS');
+
+    await wixData.update('TalentEnquiries', { ...e, status }, { suppressAuth: true });
+    return { id: enquiryId, status };
+}
+
+// --------------------------------------------------------------------------
+/** Account details. loginEmail, approved and suspended are deliberately absent. */
+export async function saveProfile(patch) { return run(() => profileImpl(patch)); }
+async function profileImpl(patch) {
+    const p = await myProfile(true);
+    if (!patch || typeof patch !== 'object') throw bad('Nothing to save.');
+
+    const str = (v, max) => {
+        if (v === null || v === undefined) return null;
+        const s = String(v).trim();
+        return s === '' ? null : s.slice(0, max);
+    };
+
+    const displayName = str(patch.displayName, 90);
+    if (!displayName) throw bad('We need a name to show on your account.');
+
+    const phone = str(patch.phone, 40);
+    if (!phone) throw bad('We need a phone number to reach you on.');
+
+    await wixData.update('TalentProfiles', {
+        ...p,
+        displayName,
+        phone,
+        whatsapp: str(patch.whatsapp, 40),
+        city: str(patch.city, 60)
+    }, { suppressAuth: true });
+
+    return {};
+}

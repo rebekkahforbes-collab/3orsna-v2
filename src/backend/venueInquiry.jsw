@@ -1,0 +1,126 @@
+// ============================================================================
+//  backend/venueInquiry.jsw
+//
+//  WHY THIS EXISTS
+//  The page called sendRequestEmail(ownerEmail, record) from the browser, with
+//  ownerEmail supplied by the client. A web method is a public HTTP endpoint —
+//  anyone could call it with any recipient and any body. That is an open email
+//  relay running on your domain's reputation.
+//
+//  Here the caller sends only the venue id and their own details. The recipient
+//  is re-derived server-side from the venue's vendor profile and is never
+//  accepted as an argument.
+// ============================================================================
+
+import wixData from 'wix-data';
+import { sendRequestEmail } from 'backend/email';
+import { currentMember } from 'wix-members-backend';
+// Who sent this enquiry, when they're logged in — so it appears on their
+// shortlist even if they typed a different email into the form.
+async function senderId() {
+    try { const m = await currentMember.getMember(); return m ? m._id : ''; } catch (e) { return ''; }
+}
+
+
+const MAX_DATES = 5;
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+// Basic shape check. Not a deliverability guarantee, just a floor.
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+
+// "YYYY-MM-DD" only. Anything else is rejected rather than coerced.
+const ISO_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function parseDateSafe(ymd) {
+    const [y, m, d] = ymd.split('-').map(Number);
+    return new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+}
+
+/**
+ * Record an inquiry against a venue and notify its vendor.
+ * @param {string} venueId
+ * @param {{name:string,email:string,phone:string,guests:number,dates:string[]}} form
+ */
+export async function submitInquiry(venueId, form) {
+
+    // ---- validate ------------------------------------------------------
+    if (!venueId || typeof venueId !== 'string') throw bad('Missing venue.');
+    if (!form || typeof form !== 'object') throw bad('Missing details.');
+
+    const name  = String(form.name  || '').trim().slice(0, 120);
+    const email = String(form.email || '').trim().slice(0, 160);
+    const phone = String(form.phone || '').trim().slice(0, 40);
+    const guests = Number(form.guests);
+
+    if (!name) throw bad('Add your name.');
+    if (!EMAIL_RE.test(email)) throw bad('That email address is not valid.');
+    if (!phone) throw bad('Add a phone number.');
+    if (!Number.isFinite(guests) || guests < 1 || guests > 10000) throw bad('Enter a guest count.');
+
+    const dates = Array.isArray(form.dates) ? form.dates.filter((d) => ISO_RE.test(d)) : [];
+    if (!dates.length) throw bad('Pick at least one date.');
+    if (dates.length > MAX_DATES) throw bad(`Pick no more than ${MAX_DATES} dates.`);
+
+    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const parsed = [...new Set(dates)].sort().map(parseDateSafe);
+    if (parsed.some((d) => d < today)) throw bad('One of those dates has already passed.');
+
+    // ---- the venue must exist and be published -------------------------
+    const venue = await wixData.get('Venues', venueId, { suppressAuth: true });
+    if (!venue) throw bad('That venue no longer exists.');
+    if (venue.visibility !== true) throw bad('That venue is not accepting inquiries right now.');
+
+    // ---- recipient comes from the data, never from the caller -----------
+    let ownerEmail = '';
+    if (venue.reference) {
+        try {
+            const vendor = await wixData.get('VendorProfiles', venue.reference, { suppressAuth: true });
+            ownerEmail = (vendor && vendor.email) || '';
+        } catch (err) {
+            console.warn('[inquiry] vendor lookup failed:', err);
+        }
+    }
+
+    // ---- store ----------------------------------------------------------
+    const memberId = await senderId();
+    const record = {
+        memberId,
+        name,
+        email,
+        phone,
+        numberOfGuests: guests,          // Number, not a string
+        suitableDates:  parsed,          // real Dates, not locale text
+        venueName:      venue.venueName || venue.title || '',
+        venueId,
+        ownerEmail,
+        submittedAt:    new Date(),
+        emailSent:      false,
+        status:         'new'            // the vendor updates it on their dashboard
+    };
+
+    const inserted = await wixData.insert('RequestDirectory', record, { suppressAuth: true });
+
+    // ---- notify ---------------------------------------------------------
+    // A failed email must not read as a failed inquiry — the enquiry is already
+    // stored, so the vendor can still be reached. Flag it for a retry job.
+    let emailSent = false;
+    if (ownerEmail) {
+        try {
+            await sendRequestEmail(ownerEmail, record);
+            emailSent = true;
+            await wixData.update('RequestDirectory',
+                { ...inserted, emailSent: true }, { suppressAuth: true });
+        } catch (err) {
+            console.error('[inquiry] email failed for', inserted._id, err);
+        }
+    } else {
+        console.warn('[inquiry] no vendor email for venue', venueId);
+    }
+
+    return { id: inserted._id, emailSent };
+}

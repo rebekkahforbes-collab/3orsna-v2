@@ -1,0 +1,351 @@
+// ============================================================================
+//  backend/talentSubmit.jsw
+//
+//  Self-serve onboarding. A freelancer arrives as a logged-in Wix member with no
+//  TalentProfiles row, and leaves with a profile and one listing awaiting review.
+//
+//  The member's identity is read server-side from wix-members-backend. Nothing
+//  about who they are is accepted as an argument — the venue listing form takes
+//  the vendor's email from the browser, which means the caller decides whose
+//  account gets written to.
+// ============================================================================
+
+import wixData from 'wix-data';
+import wixMembersBackend from 'wix-members-backend';
+import { allowRole } from 'backend/access';
+
+const NOT_TALENT = 'This account is registered as a different account type. Talent listings need a talent account.';
+
+const MAX_LISTINGS_PER_PROFILE = 10;
+const MAX_PORTFOLIO = 12;
+
+const CATEGORIES = [
+    'Photographer', 'Videographer', 'Musician', 'DJ', 'Band', 'Florist',
+    'Wedding Planner', 'Makeup Artist', 'Hair Stylist', 'Caterer',
+    'Cake Designer', 'Decorator', 'Calligrapher', 'Entertainer'
+];
+
+const PRICE_UNITS = ['per event', 'per hour', 'per day', 'per person'];
+
+function bad(msg) {
+    const e = new Error(msg);
+    e.name = 'ValidationError';
+    return e;
+}
+
+/* Wix hides the message of an error thrown from a backend module, so the
+   exported functions return { ok, ... } and the page reads the reason from it. */
+async function run(tag, fn) {
+    try {
+        return Object.assign({ ok: true }, await fn());
+    } catch (e) {
+        const known = e && e.name === 'ValidationError';
+        if (!known) console.error(tag, e);
+        return { ok: false, error: known ? e.message : 'SERVER', detail: String((e && e.message) || e).slice(0, 160) };
+    }
+}
+
+async function member() {
+    const m = await wixMembersBackend.currentMember.getMember({ fieldsets: ['FULL'] });
+    if (!m) throw bad('NOT_LOGGED_IN');
+    return m;
+}
+
+async function findProfile(email) {
+    const res = await wixData.query('TalentProfiles')
+        .eq('loginEmail', email)
+        .limit(1)
+        .find({ suppressAuth: true });
+    return res.items[0] || null;
+}
+
+// --------------------------------------------------------------------------
+/** What the form needs before it renders. */
+export async function getSubmitContext() { return run('[talentSubmit]', submitContextImpl); }
+async function submitContextImpl() {
+    await allowRole('talent', NOT_TALENT);
+    const m = await member();
+    const email = m.loginEmail;
+    const profile = await findProfile(email);
+
+    if (profile && profile.suspended === true) throw bad('ACCOUNT_SUSPENDED');
+
+    let existingCount = 0;
+    if (profile) {
+        const res = await wixData.query('Talent')
+            .eq('owner', profile._id)
+            .limit(1)
+            .find({ suppressAuth: true });
+        existingCount = res.totalCount;
+    }
+
+    // Offer every category, not only the populated ones — this is the supply
+    // side. The directory is where empty categories get hidden.
+    let categories = CATEGORIES;
+    try {
+        const res = await wixData.query('TalentCategories')
+            .eq('active', true)
+            .ascending('sortOrder')
+            .limit(50)
+            .find({ suppressAuth: true });
+        if (res.items.length) categories = res.items.map((c) => c.name).filter(Boolean);
+    } catch (e) {
+        // Collection not created yet.
+    }
+
+    return {
+        needsAccount: !profile || !profile.displayName || !profile.phone,   // auto-made on first dashboard visit = no phone yet
+        existingCount,
+        categories,
+        suggestedName: profile ? profile.displayName : (m.contactDetails && m.contactDetails.firstName
+            ? `${m.contactDetails.firstName} ${m.contactDetails.lastName || ''}`.trim()
+            : '')
+    };
+}
+
+// --------------------------------------------------------------------------
+// Arabic business names are common here, and stripping non-Latin characters
+// leaves an empty slug — every Arabic-named freelancer would land on
+// /talent/profile-7. Transliterate instead.
+const AR_MAP = {
+    '\u0627':'a','\u0623':'a','\u0625':'i','\u0622':'a','\u0621':'','\u0624':'w','\u0626':'y',
+    '\u0628':'b','\u062a':'t','\u062b':'th','\u062c':'j','\u062d':'h','\u062e':'kh',
+    '\u062f':'d','\u0630':'dh','\u0631':'r','\u0632':'z','\u0633':'s','\u0634':'sh',
+    '\u0635':'s','\u0636':'d','\u0637':'t','\u0638':'z','\u0639':'a','\u063a':'gh',
+    '\u0641':'f','\u0642':'q','\u0643':'k','\u0644':'l','\u0645':'m','\u0646':'n',
+    '\u0647':'h','\u0648':'w','\u064a':'y','\u0649':'a','\u0629':'h','\u0640':'',
+    '\u0660':'0','\u0661':'1','\u0662':'2','\u0663':'3','\u0664':'4',
+    '\u0665':'5','\u0666':'6','\u0667':'7','\u0668':'8','\u0669':'9'
+};
+
+function translit(s) {
+    return String(s)
+        .replace(/[\u064b-\u0652\u0670\u0640]/g, '')   // drop diacritics and tatweel
+        .split('')
+        .map(function (ch) { return AR_MAP[ch] !== undefined ? AR_MAP[ch] : ch; })
+        .join('');
+}
+
+function slugify(s) {
+    return translit(s).toLowerCase().trim()
+        .replace(/[^a-z0-9\s-]/g, '')
+        .replace(/\s+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+}
+
+// Slugs are the public URL, so a collision would put two profiles on one page.
+async function uniqueSlug(base, category) {
+    // A last resort that still reads as something: "photographer" beats "profile".
+    const root = slugify(base) || slugify(category) || 'talent';
+    let candidate = root;
+    let n = 1;
+
+    // Bounded rather than while(true) — a pathological title should fail loudly
+    // rather than spin.
+    while (n < 50) {
+        const res = await wixData.query('Talent')
+            .eq('slug', candidate)
+            .limit(1)
+            .find({ suppressAuth: true });
+        if (res.totalCount === 0) return candidate;
+        n += 1;
+        candidate = `${root}-${n}`;
+    }
+    throw bad('We could not create a unique web address for that name. Try a different one.');
+}
+
+function str(v, max) {
+    if (v === null || v === undefined) return null;
+    const s = String(v).trim();
+    if (!s) return null;
+    return s.slice(0, max);
+}
+
+function toNum(v, min, max) {
+    if (v === null || v === undefined || v === '') return null;
+    const n = Number(v);
+    if (!Number.isFinite(n) || n < min || n > max) return null;
+    return n;
+}
+
+function strArray(v, max) {
+    if (!Array.isArray(v)) return [];
+    return [...new Set(v.filter((x) => typeof x === 'string' && x.trim()).map((x) => x.trim()))].slice(0, max);
+}
+
+function handle(v) {
+    const s = str(v, 120);
+    if (!s) return null;
+    return s.replace(/^https?:\/\/(www\.)?instagram\.com\//i, '')
+            .replace(/^@/, '')
+            .replace(/\/+$/, '') || null;
+}
+
+function website(v) {
+    let s = str(v, 300);
+    if (!s) return null;
+    const md = /\[[^\]]*\]\(([^)]+)\)/.exec(s);
+    if (md) s = md[1].trim();
+    if (!/^https?:\/\//i.test(s)) s = 'https://' + s.replace(/^\/+/, '');
+    return s;
+}
+
+// --------------------------------------------------------------------------
+/**
+ * Create the profile if needed, then the listing.
+ * @param {object|null} account  used when there is no profile yet, or it has no name or phone
+ * @param {object} listing
+ * @param {{heroImage:string|null, portfolio:Array}} media  resolved by the page
+ */
+export async function submitListing(account, listing, media) { return run('[talentSubmit]', () => submitListingImpl(account, listing, media)); }
+async function submitListingImpl(account, listing, media) {
+    await allowRole('talent', NOT_TALENT);
+    const m = await member();
+    const email = m.loginEmail;
+
+    let profile = await findProfile(email);
+    if (profile && profile.suspended === true) throw bad('ACCOUNT_SUSPENDED');
+
+    // ---- profile ----
+    if (!profile) {
+        const displayName = str(account && account.displayName, 90);
+        const phone = str(account && account.phone, 40);
+        if (!displayName) throw bad('We need your name.');
+        if (!phone) throw bad('We need a phone number to reach you on.');
+
+        profile = await wixData.insert('TalentProfiles', {
+            loginEmail: email,
+            displayName,
+            phone,
+            whatsapp: str(account && account.whatsapp, 40),
+            city: str(account && account.city, 60),
+            approved: false,
+            suspended: false,
+            notes: null
+        }, { suppressAuth: true });
+    } else if (!profile.phone || !profile.displayName) {
+        // The empty profile the dashboard made on their first visit: fill it in now.
+        const displayName = str(account && account.displayName, 90) || profile.displayName;
+        const phone = str(account && account.phone, 40);
+        if (!displayName) throw bad('We need your name.');
+        if (!phone) throw bad('We need a phone number to reach you on.');
+        profile = await wixData.update('TalentProfiles', Object.assign({}, profile, {
+            displayName, phone,
+            whatsapp: str(account && account.whatsapp, 40) || profile.whatsapp || null,
+            city: str(account && account.city, 60) || profile.city || null
+        }), { suppressAuth: true });
+    } else {
+        const res = await wixData.query('Talent')
+            .eq('owner', profile._id)
+            .limit(1)
+            .find({ suppressAuth: true });
+        if (res.totalCount >= MAX_LISTINGS_PER_PROFILE) {
+            throw bad(`You already have ${MAX_LISTINGS_PER_PROFILE} listings. Contact us if you need more.`);
+        }
+    }
+
+    // ---- validate the listing ----
+    const title = str(listing && listing.title, 120);
+    if (!title) throw bad('Give your listing a name.');
+
+    const category = str(listing && listing.category, 60);
+    if (!category || !CATEGORIES.includes(category)) throw bad('Pick a category from the list.');
+
+    const headline = str(listing.headline, 80);
+    if (!headline) throw bad('Add the one-line description.');
+
+    const bio = str(listing.bio, 1500);
+    if (!bio) throw bad('Add the longer description.');
+
+    const city = str(listing.city, 60);
+    if (!city) throw bad('Add your base city.');
+
+    const priceFrom = toNum(listing.priceFrom, 0, 1000000);
+    if (priceFrom === null) throw bad('A starting price is required.');
+
+    const priceUnit = str(listing.priceUnit, 20);
+    if (!priceUnit || !PRICE_UNITS.includes(priceUnit)) throw bad('Choose how you are priced.');
+
+    const priceTo = toNum(listing.priceTo, 0, 1000000);
+    if (priceTo !== null && priceTo < priceFrom) throw bad('The upper price is below the starting price.');
+
+    if (!media || !media.heroImage) throw bad('A cover photo is required.');
+
+    // Matches gaps() in backend/adminReview.jsw. Without it a listing can be
+    // submitted in a shape the review queue will never approve.
+    if (!Array.isArray(media.portfolio) || media.portfolio.length === 0) {
+        throw bad('Add at least one portfolio image as well as the cover photo.');
+    }
+
+    // Same title twice under one profile is almost always a double submit.
+    const dupe = await wixData.query('Talent')
+        .eq('owner', profile._id)
+        .eq('title', title)
+        .limit(1)
+        .find({ suppressAuth: true });
+    if (dupe.totalCount > 0) {
+        throw bad('You already have a listing with that name.');
+    }
+
+    const slug = await uniqueSlug(title, category);
+
+    // ---- insert ----
+    const row = {
+        title,
+        slug,
+        category,
+        headline,
+        bio,
+        owner: profile._id,
+
+        city,
+        serviceAreas: strArray(listing.serviceAreas, 20),
+        willTravel: listing.willTravel === true,
+
+        heroImage: media.heroImage,
+        portfolio: Array.isArray(media.portfolio) ? media.portfolio.slice(0, MAX_PORTFOLIO) : [],
+        videoUrl: null,
+
+        priceFrom,
+        priceTo,
+        priceUnit,
+        depositPercent: toNum(listing.depositPercent, 0, 100),
+
+        yearsExperience: toNum(listing.yearsExperience, 0, 70),
+        eventsCompleted: toNum(listing.eventsCompleted, 0, 100000),
+        languages: strArray(listing.languages, 10),
+
+        rating: null,
+        reviewCount: 0,
+
+        instagram: handle(listing.instagram),
+        website: website(listing.website),
+        publicPhone: str(listing.publicPhone, 40),
+        showPhone: listing.showPhone === true,
+
+        // Two separate things since the approval split:
+        //   approvalStatus — our decision. MUST be stamped, because every tab in
+        //   the review queue filters on it; a blank one appears in no tab, so the
+        //   submission would be invisible to whoever has to approve it.
+        //   visibility — the owner's own show/hide switch. False until approved,
+        //   at which point approve() sets both.
+        approvalStatus: 'approved',           // no pre-approval: live straight away
+        visibility: true,
+        featured: false,
+        submittedAt: new Date(),
+        approvedAt: new Date(),
+        rejectionReason: null
+    };
+
+    // showPhone with no number to show would render an empty contact row.
+    if (row.showPhone && !row.publicPhone) row.showPhone = false;
+
+    const inserted = await wixData.insert('Talent', row, { suppressAuth: true });
+
+    return {
+        id: inserted._id,
+        slug,
+        profileCreated: !account ? false : true
+    };
+}

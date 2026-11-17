@@ -1,0 +1,86 @@
+// ============================================================================
+//  backend/listingMedia.jsw
+//  Writes listing photos to the Media Manager.
+//
+//  The iframe already resized and re-encoded each image, so what arrives here
+//  is a base64 JPEG of about 1MB or less. Everything is still re-checked on
+//  this side — anything a browser sends is a request, not a fact.
+// ============================================================================
+
+import { mediaManager } from 'wix-media-backend';
+import { currentMember } from 'wix-members-backend';
+
+/* Files each member uploaded, so cleanup can only ever delete their own
+   unsaved uploads. Kept in memory: if the backend restarts in between,
+   cleanup just skips the file and it stays in the library — harmless. */
+const UPLOADED = new Map();   // fileUrl -> memberId
+
+const FOLDER     = '/Listings';
+const MAX_BYTES  = 8 * 1024 * 1024;                // after the iframe's resize this is generous
+const ALLOWED    = ['image/jpeg', 'image/png', 'image/webp'];
+
+/**
+ * Upload one listing photo.
+ * @param {{base64: string, fileName: string, mimeType: string}} file
+ * @returns {Promise<string>} a wix:image:// URL for the Venues collection
+ */
+export async function uploadListingImage(file) {
+    // Only signed-in vendors write to the library.
+    const member = await currentMember.getMember();
+    if (!member) throw new Error('Not signed in.');
+
+    const { base64, fileName, mimeType } = file || {};
+
+    if (!base64 || typeof base64 !== 'string') {
+        throw new Error('No image data received.');
+    }
+    if (ALLOWED.indexOf(mimeType) === -1) {
+        throw new Error('Unsupported image type: ' + mimeType);
+    }
+
+    const buffer = Buffer.from(base64, 'base64');
+    if (!buffer.length) {
+        throw new Error('That image decoded to nothing.');
+    }
+    if (buffer.length > MAX_BYTES) {
+        throw new Error('That image is larger than the 8MB limit.');
+    }
+
+    const safeName = String(fileName || 'listing-photo.jpg')
+        .replace(/[^\w.\- ]+/g, '')
+        .slice(0, 80) || 'listing-photo.jpg';
+
+    const uploaded = await mediaManager.upload(
+        FOLDER,
+        buffer,
+        safeName,
+        {
+            mediaOptions: {
+                mimeType: mimeType,
+                mediaType: 'image'
+            },
+            metadataOptions: {
+                isPrivate: false,
+                isVisitorUpload: true,
+                context: { source: 'listing-form' }
+            }
+        }
+    );
+
+    // fileUrl is the wix:image:// value the Venues collection expects.
+    UPLOADED.set(uploaded.fileUrl, member._id);
+    return uploaded.fileUrl;
+}
+
+/**
+ * Delete photos that were uploaded for a listing that never saved.
+ * @param {string[]} fileUrls
+ */
+export async function removeListingImages(fileUrls) {
+    const member = await currentMember.getMember();
+    if (!member || !Array.isArray(fileUrls) || !fileUrls.length) return;
+    const mine = fileUrls.filter((u) => UPLOADED.get(u) === member._id).slice(0, 40);
+    if (!mine.length) return;
+    await mediaManager.deleteFiles(mine);
+    mine.forEach((u) => UPLOADED.delete(u));
+}
